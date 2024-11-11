@@ -509,7 +509,7 @@ class TimeSeriesAnalysis:
 
                     elif method == 'local_texture':
                         fname1 = f'{os.path.splitext(fname0)[0]}_tropolocaltexture.h5'
-                    
+
                     else:
                         msg = f'un-recognized tropospheric correction method: {method}'
                         raise ValueError(msg)
@@ -696,8 +696,8 @@ class TimeSeriesAnalysis:
 
                         else:
                             raise ValueError(f'un-recognized dataset name: {tropo_model}.')
-            # High-frequency Texture Correction (Yang et al., 2024)         
-            elif method == 'local_texture': 
+            # High-frequency Texture Correction (Yang et al., 2024)
+            elif method == 'local_texture':
                 window_size = self.template['mintpy.troposphericDelay.windowSize']
                 overlap_ratio = self.template['mintpy.troposphericDelay.overlapRatio']
                 iargs = [in_file, '-g', geom_file, '-m', mask_file, '-o', out_file, '-w' , window_size, '-r', overlap_ratio]
