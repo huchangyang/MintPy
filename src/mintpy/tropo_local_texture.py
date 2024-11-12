@@ -259,7 +259,7 @@ def intercept_filtering(dem, ts_data, inps, k_htc_interp, meta):
     ref_y = int(meta['REF_Y'])
     ref_x = int(meta['REF_X'])
     lamda = float(meta['WAVELENGTH'])
-    N, Na, Nr = ts_data.shape
+    N = ts_data.shape[0]
 
     ts_data = 4 * np.pi / lamda * ts_data[:N, :, :]
     reference_value = ts_data[:, ref_y-1, ref_x-1]
