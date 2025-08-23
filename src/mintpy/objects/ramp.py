@@ -18,6 +18,9 @@ RAMP_LIST = [
     'quadratic',
     'quadratic_range',
     'quadratic_azimuth',
+    'quadratic_azimuth_linear_range',
+    'cubic',
+    'cubic_azimuth_linear_range',
 ]
 
 
@@ -93,6 +96,12 @@ def deramp(data, mask_in=None, ramp_type='linear', metadata=None, max_num_sample
         G = np.hstack((xx**2, xx, ones))
     elif ramp_type == 'quadratic_azimuth':
         G = np.hstack((yy**2, yy, ones))
+    elif ramp_type == 'quadratic_azimuth_linear_range':
+        G = np.hstack((yy**2, yy, xx, ones))
+    elif ramp_type == 'cubic_azimuth_linear_range':
+        G = np.hstack((yy**3, yy**2, yy, xx, ones))
+    elif ramp_type == 'cubic':
+        G = np.hstack((yy**3, yy**2, yy, xx**3, xx**2, xx, ones))    
     else:
         raise ValueError(f'un-recognized ramp type: {ramp_type}')
 

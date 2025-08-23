@@ -19,6 +19,7 @@ REFERENCE = """reference:
 #TODO
 EXAMPLE = """example:
   tropo_local_texture.py  timeseries_ramp_demErr.h5 -g inputs/geometryRadar.h5  -m maskTempCoh.h5
+  tropo_local_texture.py  timeseries_ramp_demErr.h5 -g inputs/geometryRadar.h5  -m maskTempCoh.h5 --num-processes 4
 """
 
 def create_parser(subparsers=None):
@@ -40,6 +41,9 @@ def create_parser(subparsers=None):
     parser.add_argument('-r', '--overlapratio', type=float, default=0.4,
                         help='overlap ratio for window filtering')
 
+    parser.add_argument('--num-processes', type=int, default=1,
+                        help='number of parallel processes for local slope estimation (default: 1, no parallel processing)')
+
     parser.add_argument('-o', '--outfile', help='output corrected timeseries file name')
     return parser
 
@@ -57,6 +61,19 @@ def cmd_line_parse(iargs=None):
     if inps.windowsize and (inps.windowsize % 2 == 0):
         msg = f'window size {inps.windowsize} is NOT odd number'
         raise argparse.ArgumentTypeError(msg)
+
+    # check: --num-processes option (must be positive integer)
+    if inps.num_processes < 1:
+        msg = f'number of processes {inps.num_processes} must be >= 1'
+        raise argparse.ArgumentTypeError(msg)
+
+    # check: --num-processes option (should not exceed CPU count)
+    import multiprocessing as mp
+    cpu_count = mp.cpu_count()
+    if inps.num_processes > cpu_count:
+        print(f'Warning: requested {inps.num_processes} processes, but only {cpu_count} CPU cores available')
+        print(f'Setting number of processes to {cpu_count}')
+        inps.num_processes = cpu_count
 
     return inps
 

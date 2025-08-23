@@ -21,6 +21,9 @@ RAMP_LIST = [
     'quadratic',
     'quadratic_range',
     'quadratic_azimuth',
+    'quadratic_azimuth_linear_range',
+    'cubic',
+    'cubic_azimuth_linear_range',
 ]
 
 # key configuration parameter name
