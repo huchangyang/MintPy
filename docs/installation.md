@@ -10,7 +10,7 @@ MintPy is available on the <a href="https://anaconda.org/conda-forge/mintpy">con
 conda install -c conda-forge mintpy
 ```
 
-or via <code>mamba</code> as:
+or via <code>mamba</code> [recommended] as:
 
 ```bash
 mamba install -c conda-forge mintpy
@@ -73,24 +73,24 @@ Install <a href="https://github.com/conda-forge/miniforge">miniforge</a> if you 
 # for macOS, use Miniforge3-MacOSX-x86_64.sh instead.
 wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
 bash Miniforge3-Linux-x86_64.sh -b -p ~/tools/miniforge
-~/tools/miniforge/bin/mamba init bash
+~/tools/miniforge/bin/conda init bash
 ```
 
 Install dependencies into a new environment, e.g. named "insar":
 
 ```bash
-# Add "isce2"      below to install extra dependencies if you use ISCE-2
-# Add "gdal"       below to install extra dependencies if you use ARIA, FRInGE or HyP3
-# Add "gdal'<3.9'" below to install extra dependencies if you use GMTSAR
+# Add "isce2"               below to install extra dependencies if you use ISCE-2
+# Add "gdal"                below to install extra dependencies if you use ARIA, FRInGE, HyP3
+# Add "gdal libgdal-netcdf" below to install extra dependencies if you use GMTSAR
 mamba create --name insar --file ~/tools/MintPy/requirements.txt
 ```
 
 or install dependencies into an existing environment:
 
 ```bash
-# Add "isce2"      below to install extra dependencies if you use ISCE-2
-# Add "gdal"       below to install extra dependencies if you use ARIA, FRInGE or HyP3
-# Add "gdal'<3.9'" below to install extra dependencies if you use GMTSAR
+# Add "isce2"               below to install extra dependencies if you use ISCE-2
+# Add "gdal"                below to install extra dependencies if you use ARIA, FRInGE, HyP3
+# Add "gdal libgdal-netcdf" below to install extra dependencies if you use GMTSAR
 mamba activate my-existing-env
 mamba install --file ~/tools/MintPy/requirements.txt
 ```

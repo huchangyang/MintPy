@@ -108,6 +108,7 @@ def create_parser(subparsers=None):
     parser = arg_utils.add_map_argument(parser)
     parser = arg_utils.add_memory_argument(parser)
     parser = arg_utils.add_reference_argument(parser)
+    parser = arg_utils.add_shape_argument(parser)
     parser = arg_utils.add_save_argument(parser)
     parser = arg_utils.add_subset_argument(parser)
 
@@ -122,7 +123,7 @@ def cmd_line_parse(iargs=None):
     # save argv (to check the manually specified arguments)
     # use iargs        for python call
     # use sys.argv[1:] for command line call
-    inps.argv = iargs if iargs else sys.argv[1:]
+    inps.argv = iargs or sys.argv[1:]
 
     # check: --gnss-comp option (not implemented for tsview yet)
     if inps.gnss_component:

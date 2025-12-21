@@ -574,14 +574,15 @@ def plot_slice(ax, data, metadata, inps):
         else:
             raise ValueError(f'Un-recognized plotting style: {inps.style}!')
 
-        # Draw faultline using GMT lonlat file
-        if inps.faultline_file:
-            pp.plot_faultline(
+        # Draw shapes (line, polygon) from ESRI shapefile or GMT lonlat file
+        if inps.shp_file:
+            pp.plot_shape(
                 ax=ax,
-                faultline_file=inps.faultline_file,
+                shp_files=inps.shp_file,
                 SNWE=SNWE,
-                linewidth=inps.faultline_linewidth,
-                min_dist=inps.faultline_min_dist,
+                color=inps.shp_color,
+                linewidth=inps.shp_linewidth,
+                min_dist=inps.shp_min_dist,
                 print_msg=inps.print_msg,
             )
 
@@ -1652,9 +1653,15 @@ class viewer():
             no_data_val = readfile.get_no_data_value(self.file)
             if self.no_data_value is not None:
                 vprint(f'masking pixels with NO_DATA_VALUE of {self.no_data_value}')
+                # convert integer to floating to enable masking with nan
+                if np.issubdtype(data.dtype, np.integer):
+                    data = np.array(data, np.float32)
                 data[data == self.no_data_value] = np.nan
             elif no_data_val is not None and not np.isnan(no_data_val):
                 vprint(f'masking pixels with NO_DATA_VALUE of {no_data_val}')
+                # convert integer to floating to enable masking with nan
+                if np.issubdtype(data.dtype, np.integer):
+                    data = np.array(data, np.float32)
                 data[data == no_data_val] = np.nan
 
             # update/save mask info

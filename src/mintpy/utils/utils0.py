@@ -267,6 +267,30 @@ def touch(fname_list, times=None):
 
 
 ################################## Coordinate ##########################################
+def standardize_longitude(lon, limit='-180to180'):
+    """Normalize the longitude value range into (-180, 180] or [0, 360).
+
+    Parameters: lon   - float / np.ndarray, longitude in degree
+                limit - str, -180to180 or 0to360
+    Returns:    lon   - float / np.ndarray, longitude in degree
+    """
+    lon = np.asarray(lon)
+
+    # ensure data within (-180, 360)
+    lon = np.where(lon >= 360, lon - 360, lon)
+    lon = np.where(lon <= -180, lon + 360, lon)
+
+    # range option 1: ensure data within (-180, 180]
+    if limit == '-180to180':
+        lon = np.where(lon > 180, lon - 360, lon)
+
+    # range option 2: ensure data within [0, 360)
+    elif limit == '0to360' and np.nanmin(lon) < 0:
+        lon = np.where(lon < 0, lon + 360, lon)
+
+    return float(lon) if np.isscalar(lon) else lon
+
+
 def utm_zone2epsg_code(utm_zone):
     """Convert UTM Zone string to EPSG code.
 
@@ -640,6 +664,21 @@ def xyz_to_local_radius(xyz):
 #     SenD : los_inc_angle = 40, los_az_angle = -102, orb_az_angle = 168, head_angle = -168
 #     NiA  : los_inc_angle = 42, los_az_angle =  -78, orb_az_angle =  12, head_angle =  -12
 #     NiD  : los_inc_angle = 42, los_az_angle =   78, orb_az_angle = 168, head_angle = -168
+
+def orbit2los_azimuth_angle(orb_az_angle, look_direction='right'):
+    """Convert the azimuth angle of the along-track vector to the LOS vector.
+    Parameters: orb_az_angle - np.ndarray or float, azimuth angle of the SAR platform along track/orbit direction
+                               measured from the north with anti-clockwise direction as positive, in the unit of degrees
+    Returns:    los_az_angle - np.ndarray or float, azimuth angle of the LOS vector from the ground to the SAR platform
+                               measured from the north with anti-clockwise direction as positive, in the unit of degrees
+    """
+    if look_direction == 'right':
+        los_az_angle = orb_az_angle + 90
+    else:
+        los_az_angle = orb_az_angle - 90
+    los_az_angle -= np.round(los_az_angle / 360.) * 360.
+    return los_az_angle
+
 
 def los2orbit_azimuth_angle(los_az_angle, look_direction='right'):
     """Convert the azimuth angle of the LOS vector to the one of the orbit flight vector.

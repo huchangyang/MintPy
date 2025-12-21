@@ -21,7 +21,7 @@ from mintpy.objects.coord import coordinate
 from mintpy.utils import ptime, readfile, time_func, utils1 as ut
 
 GNSS_SITE_LIST_URLS = {
-    'UNR'      : 'http://geodesy.unr.edu/NGLStationPages/DataHoldings.txt',
+    'UNR'      : 'https://geodesy.unr.edu/NGLStationPages/DataHoldings.txt',
     'ESESES'   : 'http://garner.ucsd.edu/pub/measuresESESES_products/Velocities/ESESES_Velocities.txt',
     'SIDESHOW' : 'https://sideshow.jpl.nasa.gov/post/tables/table2.html',
     'GENERIC'  : None,
@@ -71,7 +71,8 @@ def search_gnss(SNWE, start_date=None, end_date=None, source='UNR', site_list_fi
 
     # ensure that site data formatting is consistent
     sites['site'] = np.array([site.upper() for site in sites['site']])
-    sites['lon'][sites['lon'] > 180] -= 360         # ensure lon values in (-180, 180]
+    # ensure longitude values in (-180, 180]
+    sites['lon'] = ut.standardize_longitude(sites['lon'], limit='-180to180')
     vprint(f'load {len(sites["site"]):d} GNSS sites with fields: {" ".join(sites.keys())}')
 
     # limit in space
@@ -472,7 +473,7 @@ class GNSS:
         std_e,n,u     - 1D np.ndarray, displacement STD in meters
     """
 
-    def __init__(self, site: str, data_dir=None, version='IGS14', source='UNR', url_prefix=None):
+    def __init__(self, site: str, data_dir=None, version='IGS20', source='UNR', url_prefix=None):
         # site info
         self.site = site
         self.source = source
@@ -797,7 +798,7 @@ class GNSS_UNR(GNSS):
         explosion for interdisciplinary science. Eos, 99. doi:10.1029/2018EO104623
 
     """
-    def __init__(self, site: str, data_dir=None, version='IGS14', url_prefix=None):
+    def __init__(self, site: str, data_dir=None, version='IGS20', url_prefix=None):
         super().__init__(
             site=site,
             data_dir=data_dir,
@@ -809,16 +810,21 @@ class GNSS_UNR(GNSS):
         # get file
         if version == 'IGS08':
             self.file = os.path.join(self.data_dir, f'{self.site:s}.{version:s}.tenv3')
-        elif version == 'IGS14':
+        elif version == 'IGS14' or version == 'IGS20':
             self.file = os.path.join(self.data_dir, f'{self.site:s}.tenv3')
         else:
-            raise ValueError(f'Un-supported GNSS versoin: {version}!')
+            raise ValueError(f'Un-supported GNSS version: {version}!')
 
         # get url
         # examples: http://geodesy.unr.edu/gps_timeseries/tenv3/IGS08/1LSU.IGS08.tenv3
         #           http://geodesy.unr.edu/gps_timeseries/tenv3/IGS14/CASU.tenv3
+        #           https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20/CAKG.tenv3
         if not self.url_prefix:
-            self.url_prefix = f'http://geodesy.unr.edu/gps_timeseries/tenv3/{self.version}'
+            if version in ['IGS08', 'IGS14']:
+                self.url_prefix = f'https://geodesy.unr.edu/gps_timeseries/tenv3/{self.version}'
+            if version == 'IGS20':
+                self.url_prefix = 'https://geodesy.unr.edu/gps_timeseries/IGS20/tenv3/IGS20'
+
         self.url = os.path.join(self.url_prefix, os.path.basename(self.file))
 
 
@@ -836,6 +842,7 @@ class GNSS_UNR(GNSS):
         # download time-series plot file
         # example link: http://geodesy.unr.edu/tsplots/IGS08/TimeSeries/CAMO.png
         #               http://geodesy.unr.edu/tsplots/IGS14/IGS14/TimeSeries/CASU.png
+        #               https://geodesy.unr.edu/gps_timeseries/IGS20/tsplots/IGS20/TimeSeries/HAND.png
         plot_file = os.path.join(self.data_dir, f'pic/{self.site}.png')
 
         # ensure local plot directory exists
@@ -844,8 +851,9 @@ class GNSS_UNR(GNSS):
 
         # get plot file url
         url_prefix = {
-            'IGS08' : 'http://geodesy.unr.edu/tsplots/IGS08/TimeSeries',
-            'IGS14' : 'http://geodesy.unr.edu/tsplots/IGS14/IGS14/TimeSeries',
+            'IGS08' : 'https://geodesy.unr.edu/tsplots/IGS08/TimeSeries',
+            'IGS14' : 'https://geodesy.unr.edu/tsplots/IGS14/IGS14/TimeSeries',
+            'IGS20' : 'https://geodesy.unr.edu/gps_timeseries/IGS20/tsplots/IGS20/TimeSeries',
         }[self.version]
         plot_file_url = os.path.join(url_prefix, f'{self.site}.png')
 
@@ -867,6 +875,9 @@ class GNSS_UNR(GNSS):
 
         data = np.loadtxt(self.file, dtype=bytes, skiprows=1, max_rows=10)
         self.site_lat, self.site_lon = data[0, 20:22].astype(float)
+        # ensure longitude in the range of (-180, 180]
+        self.site_lon = ut.standardize_longitude(self.site_lon, limit='-180to180')
+
         return self.site_lat, self.site_lon
 
 
@@ -987,8 +998,9 @@ class GNSS_ESESES(GNSS):
             # longitude
             lon_line = [x for x in lines if x.startswith('# East Longitude')][0].strip('\n')
             self.site_lon = float(lon_line.split()[-1])
-            # ensure longitude in the range of (-180, 180]
-            self.site_lon -= 0 if self.site_lon <= 180 else 360
+
+        # ensure longitude in the range of (-180, 180]
+        self.site_lon = ut.standardize_longitude(self.site_lon, limit='-180to180')
 
         return self.site_lat, self.site_lon
 
@@ -1094,6 +1106,8 @@ class GNSS_SIDESHOW(GNSS):
         # format
         self.site_lat = float(site_lat)
         self.site_lon = float(site_lon)
+        # ensure longitude in the range of (-180, 180]
+        self.site_lon = ut.standardize_longitude(self.site_lon, limit='-180to180')
 
         if print_msg == True:
             print(f'\t{self.site_lat:f}, {self.site_lon:f}')
@@ -1185,7 +1199,11 @@ class GNSS_GENERIC(GNSS):
         """
         sites = read_GENERIC_site_list('GenericList.txt')
         ind = sites['site'].tolist().index(self.site)
-        return sites['lat'][ind], sites['lon'][ind]
+        site_lat, site_lon = sites['lat'][ind], sites['lon'][ind]
+        # ensure longitude in the range of (-180, 180]
+        site_lon = ut.standardize_longitude(site_lon, limit='-180to180')
+
+        return site_lat, site_lon
 
 
     def read_displacement(self, start_date=None, end_date=None, print_msg=True, display=False):

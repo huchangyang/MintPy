@@ -17,6 +17,7 @@ from matplotlib import pyplot as plt
 from matplotlib.tri import Triangulation
 from scipy import sparse
 
+from mintpy.constants import SPEED_OF_LIGHT
 from mintpy.objects import ifgramStack, sensor
 from mintpy.utils import ptime, readfile
 
@@ -183,19 +184,37 @@ def get_date12_list(fname, dropIfgram=False):
     return date12_list
 
 
-def critical_perp_baseline(sensor_name, inc_angle, print_msg=False):
-    """Critical Perpendicular Baseline for each satellite"""
-    # Jers: 5.712e3 m (near_range=688849.0551m)
-    # Alos: 6.331e3 m (near_range=842663.2917m)
-    # Tsx : 8.053e3 m (near_range=634509.1271m)
-    sensor_dict = sensor.SENSOR_DICT[sensor_name.lower()]
-    wvl = SPEED_OF_LIGHT / sensor_dict['carrier_frequency']
-    near_range = 688849  # Yunjun 5/2016, case for Jers, need a automatic way to get this number
-    rg_bandwidth = sensor_dict['chirp_bandwidth']
-    bperp_c = wvl * (rg_bandwidth / SPEED_OF_LIGHT) * near_range * np.tan(inc_angle * np.pi / 180.0)
-    if print_msg:
-        print(f'Critical Perpendicular Baseline: {bperp_c} m')
-    return bperp_c
+def critical_perp_baseline(sensor_name, inc_angle=30, print_msg=False):
+    """Calculate the critical Perpendicular Baseline for each satellite.
+
+    Parameters: sensor_name - str, SAR sensor name
+                inc_angle   - float, LOS incidence angle in degrees
+    Returns:    bperp_crit  - float, critical perpendicular baseline in meters
+                              typical values: LT1 : 26.6 km
+                                              TSX :  8.1 km
+                                              ALOS:  6.3 km
+                                              JERS:  5.7 km
+    """
+    sensor_name = sensor_name.lower()
+    if sensor_name not in sensor.SENSOR_DICT.keys():
+        raise ValueError(f'Un-recognized sensor_name: {sensor_name}')
+
+    # sensor parameters
+    near_range = {
+        # typical values
+        'lt1' : 725702,
+        'tsx' : 634509,
+        'alos': 842663,
+        'jers': 688849,
+    }[sensor_name]
+    wvl = SPEED_OF_LIGHT / sensor.SENSOR_DICT[sensor_name]['carrier_frequency']
+    range_bandwidth = sensor.SENSOR_DICT[sensor_name]['chirp_bandwidth']
+
+    # calculate critical perpendicular baseline
+    bperp_crit = wvl * (range_bandwidth / SPEED_OF_LIGHT) * near_range * np.tan(np.deg2rad(inc_angle))
+    print(f'critical perpendicular baseline: {bperp_crit} m') if print_msg else None
+
+    return bperp_crit
 
 
 def calculate_doppler_overlap(dop_a, dop_b, bandwidth_az):
@@ -227,14 +246,16 @@ def calculate_doppler_overlap(dop_a, dop_b, bandwidth_az):
     return dop_overlap
 
 
-def simulate_coherence_v2(date12_list, decor_time=200.0, coh_resid=0.2, inc_angle=40, sensor_name='Sen',
-                          display=False):
+def simulate_coherence_v2(date12_list, decor_time=200.0, coh_resid=0.2, inc_angle=40,
+                          SNR=22, sensor_name='Sen', display=False):
     """Simulate coherence version 2 (without using bl_list.txt file).
     Parameters: date12_list - list of string in YYYYMMDD_YYYYMMDD format, indicating pairs configuration
                 decor_time  - float, decorrelation rate in days, time for coherence to drop to 1/e of its initial value
                 coh_resid   - float, long-term coherence, minimum attainable coherence value
                 inc_angle   - float, incidence angle in degrees
                 sensor_name - string, SAR sensor name
+                SNR         - float, signal-to-noise ratio in dB
+                              NESZ = -22 dB from Table 1 in https://sentinels.copernicus.eu/web/sentinel
                 display     - bool, display result as matrix or not
     Returns:    coh         - 2D np.array in size of (ifgram_num)
     """
@@ -244,8 +265,7 @@ def simulate_coherence_v2(date12_list, decor_time=200.0, coh_resid=0.2, inc_angl
     date_list = sorted(list(set(date1s + date2s)))
     tbase_list = ptime.date_list2tbase(date_list)[0]
 
-    SNR = 10 ** (22 / 10)  # NESZ = -22 dB from Table 1 in https://sentinels.copernicus.eu/web/sentinel/
-    coh_thermal = 1. / (1. + 1./SNR)
+    coh_thermal = 1. / ( 1. + 1. / 10**(SNR / 10) )
 
     # bperp
     rng = np.random.default_rng(2)
@@ -500,30 +520,30 @@ def threshold_temporal_baseline(date12_list, btemp_max, keep_seasonal=True, btem
 
 
 def coherence_matrix(date12_list, coh_list, diag_value=np.nan, fill_triangle='both', date_list=None):
-    """Return coherence matrix based on input date12 list and its coherence
-    Inputs:
-        date12_list - list of string in YYMMDD-YYMMDD format
-        coh_list    - list of float, average coherence for each interferograms
-        diag_value  - number, value to be filled in the diagonal
-        fill_triangle - str, 'both', 'upper', 'lower'
-    Output:
-        coh_matrix  - 2D np.array with dimension length = date num
-                      np.nan value for interferograms non-existed.
-                      1.0 for diagonal elements
+    """Return coherence matrix based on input date12 list and their coherence.
+
+    Parameters: date12_list   - list(str) in YYMMDD-YYMMDD or YYYYMMDD_YYYYMMDD format
+                coh_list      - list(float), average coherence for each interferogram
+                diag_value    - number, value to be filled in the diagonal
+                fill_triangle - str, 'both', 'upper', 'lower'
+    Returns:    coh_mat       - 2D np.ndarray in size of (num_date, num_date)
+                                np.nan for interferograms non-existent.
+                                1.0    for diagonal elements
     """
-    # Get date list
-    date12_list = ptime.yymmdd_date12(date12_list)
+    # get date list
+    # Use YYYYMMDD format instead of YYMMDD to ensure a correctly sorted list for dates before & after 2000
+    date12_list = ptime.yyyymmdd_date12(date12_list)
     if not date_list:
-        m_dates = [date12.split('-')[0] for date12 in date12_list]
-        s_dates = [date12.split('-')[1] for date12 in date12_list]
+        m_dates = [date12.split('_')[0] for date12 in date12_list]
+        s_dates = [date12.split('_')[1] for date12 in date12_list]
         date_list = sorted(list(set(m_dates + s_dates)))
-    date_list = ptime.yymmdd(date_list)
+    date_list = ptime.yyyymmdd(date_list)
     date_num = len(date_list)
 
     coh_mat = np.zeros([date_num, date_num])
     coh_mat[:] = np.nan
     for date12 in date12_list:
-        date1, date2 = date12.split('-')
+        date1, date2 = date12.split('_')
         idx1 = date_list.index(date1)
         idx2 = date_list.index(date2)
         coh = coh_list[date12_list.index(date12)]
