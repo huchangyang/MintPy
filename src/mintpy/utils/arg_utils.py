@@ -278,11 +278,14 @@ def add_gnss_argument(parser):
     gnss.add_argument('--show-gnss','--show-gps', dest='disp_gnss', action='store_true',
                       help='Show UNR GNSS location within the coverage.')
     gnss.add_argument('--gnss-source','--gnss-src','--gps-source', dest='gnss_source', default='UNR',
-                      choices={'UNR', 'SIDESHOW', 'ESESES', 'GENERIC'},
+                      choices={'UNR', 'SIDESHOW', 'ESESES', 'TGM', 'GENERIC'},
                       help='Source of the GNSS displacement solution (default: %(default)s).\n'
                            'UNR      : Nevada Geodetic Lab at Univ. of Nevada, Reno (Blewitt et al., 2018, Eos)\n'
                            'SIDESHOW : Jet Propulsion Lab (JPL) GNSS time series (Heflin et al., 2020, ESS)\n'
-                           'ESESES   : Enhanced Solid Earth Science ESDR System (ESESES) by JPL and SOPAC')
+                           'ESESES   : Enhanced Solid Earth Science ESDR System (ESESES) by JPL and SOPAC\n'
+                           'TGM      : Taiwan Geodetic Model (tgm.earth.sinica.edu.tw); use --gnss-dir for data')
+    gnss.add_argument('--gnss-dir', dest='gnss_dir', type=str, metavar='DIR',
+                      help='Directory for local GNSS time series (required for TGM: path to *.txt files)')
 
     # compare GNSS with InSAR
     gnss.add_argument('--gnss-comp','--gps-comp', dest='gnss_component',
@@ -297,6 +300,9 @@ def add_gnss_argument(parser):
                       help='start date of GNSS data, default: the 1st SAR acquisition')
     gnss.add_argument('--gnss-end-date','--gps-end-date', dest='gnss_end_date', type=str, metavar='YYYYMMDD',
                       help='end   date of GNSS data, default: the last SAR acquisition')
+    gnss.add_argument('--gnss-full-span', dest='gnss_vel_full_span', action='store_true',
+                      help='Estimate GNSS velocity over full GNSS time span for comparison with InSAR '
+                           '(default: use InSAR overlapping period).')
     gnss.add_argument('--horz-az','--hz-az', dest='horz_az_angle', type=float, default=-90., metavar='NUM',
                       help='Azimuth angle (anti-clockwise from the north) of the horizontal movement in degrees\n'
                            'E.g.: -90. for east  direction [default]\n'

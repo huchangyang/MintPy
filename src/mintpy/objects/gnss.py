@@ -12,8 +12,9 @@
 import csv
 import datetime as dt
 import glob
+import json
 import os
-from urllib.request import urlopen, urlretrieve
+from urllib.request import urlopen, urlretrieve, Request
 
 import numpy as np
 
@@ -24,9 +25,11 @@ GNSS_SITE_LIST_URLS = {
     'UNR'      : 'https://geodesy.unr.edu/NGLStationPages/DataHoldings.txt',
     'ESESES'   : 'https://garner.ucsd.edu/pub/measuresESESES_products/Velocities/ESESES_Velocities.txt',
     'SIDESHOW' : 'https://sideshow.jpl.nasa.gov/post/tables/table2.html',
+    'TGM'      : 'https://tgm.earth.sinica.edu.tw/map',  # page with embedded JSON; parsed for station_code, lng, lat
     'GENERIC'  : None,
 }
 GNSS_SOURCES = list(GNSS_SITE_LIST_URLS.keys())
+TGM_SITE_LIST_FILENAME = 'TGM_site_list.txt'
 
 
 
@@ -52,6 +55,8 @@ def search_gnss(SNWE, start_date=None, end_date=None, source='UNR', site_list_fi
     if site_list_file is None:
         if source == 'GENERIC':
             raise ValueError('Site list file must be specified for GENERIC GNSS source!')
+        elif source == 'TGM':
+            site_list_file = TGM_SITE_LIST_FILENAME
         else:
             site_list_file = os.path.basename(GNSS_SITE_LIST_URLS[source])
 
@@ -66,6 +71,8 @@ def search_gnss(SNWE, start_date=None, end_date=None, source='UNR', site_list_fi
         sites = read_ESESES_site_list(site_list_file)
     elif source == 'SIDESHOW':
         sites = read_SIDESHOW_site_list(site_list_file)
+    elif source == 'TGM':
+        sites = read_TGM_site_list(site_list_file)
     elif source == 'GENERIC':
         sites = read_GENERIC_site_list(site_list_file)
 
@@ -103,9 +110,17 @@ def search_gnss(SNWE, start_date=None, end_date=None, source='UNR', site_list_fi
 
 def dload_site_list(out_file=None, source='UNR', print_msg=True) -> str:
     """Download single file with list of GNSS site locations.
+    For TGM, fetch the map page and parse embedded JSON to build the site list.
     """
     # check source is supported
     assert source in GNSS_SOURCES, f'{source:s} GNSS is NOT supported! Use one of {GNSS_SOURCES}.'
+
+    if source == 'TGM':
+        if out_file is None:
+            out_file = TGM_SITE_LIST_FILENAME
+        if not os.path.isfile(out_file):
+            _dload_TGM_site_list(out_file, print_msg=print_msg)
+        return out_file
 
     # determine URL
     site_list_url = GNSS_SITE_LIST_URLS[source]
@@ -121,6 +136,68 @@ def dload_site_list(out_file=None, source='UNR', print_msg=True) -> str:
         urlretrieve(site_list_url, out_file)  #nosec
 
     return out_file
+
+
+def _dload_TGM_site_list(out_file, print_msg=True):
+    """Fetch TGM map page, parse embedded JSON (var data = [...]), write site list file.
+    File format: space-separated station_code lon lat (same as GENERIC).
+    """
+    import re
+    vprint = print if print_msg else lambda *args, **kwargs: None
+    site_list_url = GNSS_SITE_LIST_URLS['TGM']
+    vprint(f'fetching TGM station list from {site_list_url:s} ...')
+    req = Request(site_list_url, headers={'User-Agent': 'MintPy/1.0'})
+    with urlopen(req) as resp:  # nosec
+        html = resp.read().decode('utf-8', errors='replace')
+    # Find "var data = " then extract the following [...] by bracket counting
+    # (greedy regex would capture past the array due to nested brackets elsewhere)
+    match = re.search(r'var\s+data\s*=\s*\[', html)
+    if not match:
+        raise RuntimeError('Could not find "var data = [" in TGM map page.')
+    start = match.end() - 1  # index of the opening [
+    depth = 0
+    i = start
+    while i < len(html):
+        if html[i] == '[':
+            depth += 1
+        elif html[i] == ']':
+            depth -= 1
+            if depth == 0:
+                raw = html[start:i + 1]
+                break
+        i += 1
+    else:
+        raise RuntimeError('Could not find end of "var data = [...]" in TGM map page.')
+    try:
+        rows = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f'Failed to parse TGM station JSON: {e}')
+    lines = []
+    for r in rows:
+        code = r.get('station_code')
+        lng = float(r.get('lng', r.get('lon', 0)))
+        lat = float(r.get('lat', 0))
+        if code is not None:
+            lines.append(f'{code} {lng:.6f} {lat:.6f}')
+    with open(out_file, 'w') as f:
+        f.write('site lon lat\n')
+        f.write('\n'.join(lines))
+    vprint(f'wrote {len(lines)} TGM stations to {out_file:s}')
+
+
+def read_TGM_site_list(site_list_file: str):
+    """Return names and lon/lat for TGM GNSS stations.
+    File format: first line "site lon lat", then "station_code lon lat" per line.
+    """
+    fc = np.loadtxt(site_list_file, dtype=str, skiprows=1)
+    if fc.ndim == 1:
+        fc = fc.reshape(1, -1)
+    sites = {
+        'site': fc[:, 0],
+        'lon': fc[:, 1].astype(np.float32),
+        'lat': fc[:, 2].astype(np.float32),
+    }
+    return sites
 
 
 def read_UNR_site_list(site_list_file:str):
@@ -195,7 +272,7 @@ def read_GENERIC_site_list(site_list_file:str):
 ######################################### Utils Functions ###########################################
 
 def get_los_obs(meta, obs_type, site_names, start_date, end_date, source='UNR', gnss_comp='enu2los',
-                horz_az_angle=-90., model=None, print_msg=True, redo=False):
+                horz_az_angle=-90., model=None, print_msg=True, redo=False, gnss_data_dir=None, full_span=False):
     """Get the GNSS LOS observations given the query info.
 
     Parameters: meta       - dict, dictionary of metadata of the InSAR file
@@ -211,6 +288,9 @@ def get_los_obs(meta, obs_type, site_names, start_date, end_date, source='UNR', 
                 model      - dict, time function model, e.g. {'polynomial': 1, 'periodic': [1.0, 0.5]}
                 print_msg  - bool, print verbose info
                 redo       - bool, ignore existing CSV file and re-calculate
+                gnss_data_dir - str, optional; for TGM source, directory containing *.txt time series
+                full_span - bool, if True estimate velocity over full GNSS time span (start_date/end_date
+                            ignored for velocity; used for comparison with InSAR over full GNSS period)
     Returns:    site_obs   - 1D np.ndarray(), GNSS LOS velocity or displacement in m or m/yr
     Examples:   from mintpy.objects import gnss
                 from mintpy.utils import readfile, utils as ut
@@ -227,11 +307,14 @@ def get_los_obs(meta, obs_type, site_names, start_date, end_date, source='UNR', 
     assert obs_type in ['displacement', 'velocity'], f'un-supported obs_type: {obs_type}'
     obs_ind = 3 if obs_type.lower() == 'displacement' else 4
 
-    # GNSS CSV file info
+    # GNSS CSV file info (use separate cache for full_span velocity)
     file_dir = os.path.dirname(meta['FILE_PATH'])
     csv_file = os.path.join(file_dir, f'gnss_{gnss_comp:s}')
     csv_file += f'{horz_az_angle:.0f}' if gnss_comp == 'horz' else ''
-    csv_file += f'_{source.upper()}.csv'
+    csv_file += f'_{source.upper()}'
+    if full_span and obs_type == 'velocity':
+        csv_file += '_fullspan'
+    csv_file += '.csv'
     col_names = ['Site', 'Lon', 'Lat', 'Displacement', 'Velocity']
     col_types = ['U10'] + ['f8'] * (len(col_names) - 1)
     vprint(f'default GNSS observation file name: {csv_file:s}')
@@ -248,6 +331,8 @@ def get_los_obs(meta, obs_type, site_names, start_date, end_date, source='UNR', 
     if not redo and os.path.isfile(csv_file) and num_row >= num_site:
         # read from existing CSV file
         vprint(f'read GNSS observations from file: {csv_file:s}')
+        if source == 'TGM' and print_msg:
+            vprint('  (TGM: if values look wrong, use --gnss-redo; use --ref-gnss to match InSAR reference)')
         fc = np.genfromtxt(csv_file, dtype=col_types, delimiter=',', names=True)
         site_obs = fc[col_names[obs_ind]]
 
@@ -279,17 +364,28 @@ def get_los_obs(meta, obs_type, site_names, start_date, end_date, source='UNR', 
         # get url_prefix [to speed up downloading for ESESES]
         url_prefix = get_ESESES_url_prefix() if source == 'ESESES' else None
 
+        # data_dir for local sources (e.g. TGM)
+        if source == 'TGM' and gnss_data_dir is None:
+            gnss_data_dir = os.path.join(file_dir, 'GNSS-TGM')
+
         # loop for calculation
         prog_bar = ptime.progressBar(maxValue=num_site, print_msg=print_msg)
         for i, site_name in enumerate(site_names):
             prog_bar.update(i+1, suffix=f'{i+1}/{num_site} {site_name:s}')
 
             # calculate GNSS data value
-            gnss_obj = get_gnss_class(source)(site_name, url_prefix=url_prefix)
+            kwargs = dict(url_prefix=url_prefix)
+            if source == 'TGM' and gnss_data_dir is not None:
+                kwargs['data_dir'] = gnss_data_dir
+            gnss_obj = get_gnss_class(source)(site_name, **kwargs)
+            vel_start = None
+            vel_end = None
+            if not (full_span and obs_type == 'velocity'):
+                vel_start, vel_end = start_date, end_date
             vel, dis_ts = gnss_obj.get_los_velocity(
                 geom_obj,
-                start_date=start_date,
-                end_date=end_date,
+                start_date=vel_start,
+                end_date=vel_end,
                 gnss_comp=gnss_comp,
                 horz_az_angle=horz_az_angle,
                 model=model,
@@ -342,7 +438,7 @@ def get_baseline_change(dates1, pos_x1, pos_y1, pos_z1,
     return dates, bases
 
 
-def get_gnss_class(source:str):
+def get_gnss_class(source: str):
     """Return the appropriate GNSS child class based on processing source.
     """
     if source == 'UNR':
@@ -351,6 +447,8 @@ def get_gnss_class(source:str):
         return GNSS_ESESES
     elif source == 'SIDESHOW':
         return GNSS_SIDESHOW
+    elif source == 'TGM':
+        return GNSS_TGM
     elif source == 'GENERIC':
         return GNSS_GENERIC
     else:
@@ -752,7 +850,7 @@ class GNSS:
         Returns:    dates         - 1D np.ndarray, datetime.datetime object
                     dis           - 1D np.ndarray, displacement in meters
         """
-        # retrieve displacement data
+        # retrieve displacement data (use requested date range, usually from InSAR)
         dates, dis = self.get_los_displacement(
             geom_obj,
             start_date=start_date,
@@ -762,13 +860,25 @@ class GNSS:
             horz_az_angle=horz_az_angle,
         )[:2]
 
+        # if requested range has no/few points (e.g. GNSS and InSAR periods don't overlap),
+        # retry with full GNSS range so we still get a velocity
+        if len(dates) <= 2 and (start_date or end_date):
+            dates, dis = self.get_los_displacement(
+                geom_obj,
+                start_date=None,
+                end_date=None,
+                ref_site=ref_site,
+                gnss_comp=gnss_comp,
+                horz_az_angle=horz_az_angle,
+            )[:2]
+
         # displacement -> velocity
         # if 1. num of observations > 2 AND
-        #    2. time overlap > 1/4
+        #    2. time overlap > 1/4 (when using requested range)
         dis2vel = True
         if len(dates) <= 2:
             dis2vel = False
-        elif start_date and end_date:
+        elif start_date and end_date and len(dates) > 0:
             t0 = ptime.date_list2vector([start_date])[0][0]
             t1 = ptime.date_list2vector([end_date])[0][0]
             if dates[-1] - dates[0] <= (t1 - t0) / 4:
@@ -782,7 +892,10 @@ class GNSS:
         else:
             self.velocity = np.nan
             if print_msg:
-                print(f'\nVelocity calculation failed for site {self.site:s}')
+                msg = f'\nVelocity calculation failed for site {self.site:s}'
+                if len(dates) <= 2 and (start_date or end_date):
+                    msg += f' (no/few GNSS points in {start_date or "?"}-{end_date or "?"}; check date overlap with InSAR)'
+                print(msg)
 
         return self.velocity, dis
 
@@ -1143,6 +1256,104 @@ class GNSS_SIDESHOW(GNSS):
 
         # display if requested
         if display == True:
+            self.plot()
+
+        return (self.dates,
+                self.dis_e, self.dis_n, self.dis_u,
+                self.std_e, self.std_n, self.std_u)
+
+
+class GNSS_TGM(GNSS):
+    """GNSS class for daily solutions from Taiwan Geodetic Model (TGM).
+
+    Website: https://tgm.earth.sinica.edu.tw/
+
+    Local data: directory (e.g. --gnss-dir) containing:
+    - One *.txt file per site, e.g. HUSI.txt, with header line and columns:
+      date(float), date(yyyy-mm-dd), dN, dE, dU, sN, sE, sU
+      (displacement and std in North, East, Up in meters.)
+    Site list (station_code, lng, lat) is obtained from the TGM map page or
+    from a local TGM_site_list.txt (see read_TGM_site_list).
+    """
+    def __init__(self, site: str, data_dir=None, version='IGS14', url_prefix=None):
+        super().__init__(
+            site=site,
+            data_dir=data_dir,
+            version=version,
+            source='TGM',
+            url_prefix=url_prefix,
+        )
+
+        # TGM time series: <station_code>.txt (e.g. HUSI.txt)
+        self.file = os.path.join(self.data_dir, f'{self.site:s}.txt')
+        self.url = None
+
+    def get_site_lat_lon(self, print_msg=False):
+        """Get station lat/lon from TGM site list (TGM_site_list.txt in data_dir or cwd).
+        """
+        for cand in [os.path.join(self.data_dir, TGM_SITE_LIST_FILENAME),
+                     TGM_SITE_LIST_FILENAME]:
+            if os.path.isfile(cand):
+                sites = read_TGM_site_list(cand)
+                break
+        else:
+            dload_site_list(out_file=TGM_SITE_LIST_FILENAME, source='TGM', print_msg=print_msg)
+            sites = read_TGM_site_list(TGM_SITE_LIST_FILENAME)
+
+        idx = np.where(sites['site'] == self.site)[0]
+        if len(idx) == 0:
+            # try case-insensitive
+            idx = np.where(np.char.upper(sites['site'].astype(str)) == self.site.upper())[0]
+        if len(idx) == 0:
+            raise ValueError(f'Site {self.site} not found in TGM site list.')
+        i = idx[0]
+        self.site_lat = float(sites['lat'][i])
+        self.site_lon = float(sites['lon'][i])
+        self.site_lon = ut.standardize_longitude(self.site_lon, limit='-180to180')
+        return self.site_lat, self.site_lon
+
+    def read_displacement(self, start_date=None, end_date=None, print_msg=True, display=False):
+        """Read GNSS displacement time-series from TGM format file.
+
+        File format: header "date(float),date(yyyy-mm-dd),dN,dE,dU,sN,sE,sU",
+        then one row per epoch. TGM uses **millimeters (mm)** for dN,dE,dU and sN,sE,sU;
+        values are converted to meters here so downstream velocity is in m/yr.
+        If the file is missing (e.g. no local data for this station), returns empty
+        arrays so the caller gets velocity=nan and can skip this site without failing.
+        """
+        vprint = print if print_msg else lambda *args, **kwargs: None
+        if not os.path.isfile(self.file):
+            vprint(f'  skip {self.site}: no time series file {self.file}')
+            empty = np.array([], dtype=np.float32)
+            self.dates = np.array([], dtype=object)
+            self.date_list = []
+            self.dis_n = self.dis_e = self.dis_u = empty.copy()
+            self.std_n = self.std_e = self.std_u = empty.copy()
+            return (self.dates,
+                    self.dis_e, self.dis_n, self.dis_u,
+                    self.std_e, self.std_n, self.std_u)
+
+        vprint('reading time and displacement in east/north/vertical direction (TGM format)')
+        # skip header; columns: date(float), date(yyyy-mm-dd), dN, dE, dU, sN, sE, sU
+        fc = np.loadtxt(self.file, dtype=str, skiprows=1, delimiter=',')
+        if fc.ndim == 1:
+            fc = fc.reshape(1, -1)
+
+        # dates from column 1 (yyyy-mm-dd)
+        self.dates = np.array([dt.datetime.strptime(x.strip(), '%Y-%m-%d') for x in fc[:, 1]])
+
+        # dN, dE, dU and sN, sE, sU are in mm (TGM convention); convert to m for MintPy (m, m/yr)
+        mm2m = 0.001
+        self.dis_n = fc[:, 2].astype(np.float32) * mm2m
+        self.dis_e = fc[:, 3].astype(np.float32) * mm2m
+        self.dis_u = fc[:, 4].astype(np.float32) * mm2m
+        self.std_n = fc[:, 5].astype(np.float32) * mm2m
+        self.std_e = fc[:, 6].astype(np.float32) * mm2m
+        self.std_u = fc[:, 7].astype(np.float32) * mm2m
+
+        self._crop_to_date_range(start_date, end_date)
+
+        if display:
             self.plot()
 
         return (self.dates,

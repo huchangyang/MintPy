@@ -545,7 +545,14 @@ def plot_slice(ax, data, metadata, inps):
         # Reference (InSAR) data to a GNSS site
         coord = ut.coordinate(metadata)
         if inps.disp_gnss and inps.gnss_component and inps.ref_gnss_site:
-            gnss_obj = gnss.get_gnss_class(inps.gnss_source)(site=inps.ref_gnss_site)
+            gnss_kwargs = {'site': inps.ref_gnss_site}
+            if inps.gnss_source == 'TGM':
+                gnss_dir = getattr(inps, 'gnss_dir', None)
+                if gnss_dir is None and metadata.get('FILE_PATH'):
+                    gnss_dir = os.path.join(os.path.dirname(metadata['FILE_PATH']), 'GNSS-TGM')
+                if gnss_dir:
+                    gnss_kwargs['data_dir'] = gnss_dir
+            gnss_obj = gnss.get_gnss_class(inps.gnss_source)(**gnss_kwargs)
             ref_site_lalo = gnss_obj.get_site_lat_lon()
             y, x = coord.geo2radar(ref_site_lalo[0], ref_site_lalo[1])[0:2]
             ref_data = data[y - inps.pix_box[1], x - inps.pix_box[0]]

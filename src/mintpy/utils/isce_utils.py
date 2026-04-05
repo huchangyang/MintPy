@@ -242,7 +242,12 @@ def extract_stripmap_metadata(meta_file):
     meta['polarization'] = str(frame.polarization).replace('/', '')
     if meta['polarization'].startswith("b'"):
         meta['polarization'] = meta['polarization'][2:4]
-
+    
+    # Extract passDirection if available
+    if hasattr(frame, 'passDirection') and frame.passDirection:
+        meta['passDirection'] = frame.passDirection
+    elif hasattr(frame, '_passDirection') and frame._passDirection:
+        meta['passDirection'] = frame._passDirection
     time_seconds = (frame.sensingMid.hour * 3600.0 +
                     frame.sensingMid.minute * 60.0 +
                     frame.sensingMid.second)

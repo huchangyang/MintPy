@@ -38,6 +38,8 @@ EXAMPLE = """example:
   view.py geo_velocity_msk.h5 velocity --show-gnss --gnss-label   #show locations of available GPS
   view.py geo_velocity_msk.h5 velocity --show-gnss --gnss-comp enu2los --ref-gnss GV01
   view.py geo_velocity_msk.h5 velocity --show-gnss --gnss-comp enu2los --ref-gnss GV01 --gnss-source ESESES
+  view.py geo_velocity.h5 velocity --show-gnss --gnss-source TGM --gnss-dir /path/to/gnss_tgm --gnss-comp enu2los
+  view.py geo_velocity.h5 velocity --show-gnss --gnss-comp enu2los --ref-gnss S103 --gnss-full-span  # GNSS rate over full span vs InSAR
   view.py geo_timeseries_ERA5_ramp_demErr.h5 20180619 --ref-date 20141213 --show-gnss --gnss-comp enu2los --ref-gnss GV01
 
   # Faults
