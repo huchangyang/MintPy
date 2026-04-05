@@ -1150,6 +1150,13 @@ def estimate_coherence(intfile, corfile):
     icu_obj.useAmplitudeFlag = False
     #icu_obj.correlationType = 'NOSLOPE'
 
+    # For small images, use single patch mode
+    img_length = filt_img.getLength()
+    if img_length < 500:  
+        icu_obj.singlePatch = True
+    else:
+        icu_obj.azimuthBufferSize = min(3700, img_length + 300)
+
     # run
     icu_obj.icu(intImage=filt_img, phsigImage=phsig_img)
     phsig_img.renderHdr()

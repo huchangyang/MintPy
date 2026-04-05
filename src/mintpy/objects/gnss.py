@@ -21,8 +21,8 @@ from mintpy.objects.coord import coordinate
 from mintpy.utils import ptime, readfile, time_func, utils1 as ut
 
 GNSS_SITE_LIST_URLS = {
-    'UNR'      : 'http://geodesy.unr.edu/NGLStationPages/DataHoldings.txt',
-    'ESESES'   : 'http://garner.ucsd.edu/pub/measuresESESES_products/Velocities/ESESES_Velocities.txt',
+    'UNR'      : 'https://geodesy.unr.edu/NGLStationPages/DataHoldings.txt',
+    'ESESES'   : 'https://garner.ucsd.edu/pub/measuresESESES_products/Velocities/ESESES_Velocities.txt',
     'SIDESHOW' : 'https://sideshow.jpl.nasa.gov/post/tables/table2.html',
     'GENERIC'  : None,
 }
@@ -363,7 +363,7 @@ def get_ESESES_url_prefix():
     """
     print('searching for ESESES url_prefix ...')
     # url prefix format
-    url_fmt = 'http://garner.ucsd.edu/pub/measuresESESES_products/Timeseries'
+    url_fmt = 'https://garner.ucsd.edu/pub/measuresESESES_products/Timeseries'
     url_fmt += '/CurrentUntarred/Clean_TrendNeuTimeSeries_comb_{:s}'
 
     # start with today and check back in time
@@ -791,7 +791,7 @@ class GNSS_UNR(GNSS):
     """GNSS child class for daily solutions processed by Nevada Geodetic Lab
     at University of Nevada, Reno (UNR).
 
-    Website: http://geodesy.unr.edu/NGLStationPages/GlobalStationList
+    Website: https://geodesy.unr.edu/NGLStationPages/GlobalStationList
 
     Reference:
       Blewitt, G., Hammond, W., & Kreemer, C. (2018). Harnessing the GPS data
@@ -816,10 +816,10 @@ class GNSS_UNR(GNSS):
             raise ValueError(f'Un-supported GNSS versoin: {version}!')
 
         # get url
-        # examples: http://geodesy.unr.edu/gps_timeseries/tenv3/IGS08/1LSU.IGS08.tenv3
-        #           http://geodesy.unr.edu/gps_timeseries/tenv3/IGS14/CASU.tenv3
+        # examples: https://geodesy.unr.edu/gps_timeseries/IGS08/1LSU.IGS08.tenv3
+        #           https://geodesy.unr.edu/gps_timeseries/IGS14/CASU.tenv3
         if not self.url_prefix:
-            self.url_prefix = f'http://geodesy.unr.edu/gps_timeseries/tenv3/{self.version}'
+            self.url_prefix = f'https://geodesy.unr.edu/gps_timeseries/tenv3/{self.version}'
         self.url = os.path.join(self.url_prefix, os.path.basename(self.file))
 
 
@@ -835,8 +835,8 @@ class GNSS_UNR(GNSS):
         super().dload_site(overwrite=overwrite, print_msg=print_msg)
 
         # download time-series plot file
-        # example link: http://geodesy.unr.edu/tsplots/IGS08/TimeSeries/CAMO.png
-        #               http://geodesy.unr.edu/tsplots/IGS14/IGS14/TimeSeries/CASU.png
+        # example link: https://geodesy.unr.edu/tsplots/IGS08/TimeSeries/CAMO.png
+        #               https://geodesy.unr.edu/tsplots/IGS14/IGS14/TimeSeries/CASU.png
         plot_file = os.path.join(self.data_dir, f'pic/{self.site}.png')
 
         # ensure local plot directory exists
@@ -845,8 +845,8 @@ class GNSS_UNR(GNSS):
 
         # get plot file url
         url_prefix = {
-            'IGS08' : 'http://geodesy.unr.edu/tsplots/IGS08/TimeSeries',
-            'IGS14' : 'http://geodesy.unr.edu/tsplots/IGS14/IGS14/TimeSeries',
+            'IGS08' : 'https://geodesy.unr.edu/tsplots/IGS08/TimeSeries',
+            'IGS14' : 'https://geodesy.unr.edu/tsplots/IGS14/IGS14/TimeSeries',
         }[self.version]
         plot_file_url = os.path.join(url_prefix, f'{self.site}.png')
 
@@ -924,7 +924,7 @@ class GNSS_ESESES(GNSS):
     Earth Science ESDR System (ESESES) project by JPL and SOPAC.
 
     Website: https://cddis.nasa.gov/Data_and_Derived_Products/GNSS/ESESES_products.html
-             http://garner.ucsd.edu/pub/measuresESESES_products/
+             https://garner.ucsd.edu/pub/measuresESESES_products/
     """
     def __init__(self, site: str, data_dir=None, version='IGS14', url_prefix=None):
         super().__init__(

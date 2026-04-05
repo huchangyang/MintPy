@@ -458,6 +458,15 @@ def save_kmz(inps):
         data[data == 0] = np.nan
     del mask
 
+    # Check if WAVELENGTH is needed but missing
+    data_unit = atr.get('UNIT', 'm').lower().split('/')[0]
+    disp_unit_lower = inps.disp_unit.lower().split('/')[0]
+    if data_unit == 'radian' and 'WAVELENGTH' not in atr.keys():
+        if disp_unit_lower not in ['radians', 'radian', 'rad', 'r']:
+            print(f'WARNING: Missing WAVELENGTH metadata. Cannot convert phase (radian) to {inps.disp_unit}.')
+            print(f'         Using radian as display unit instead.')
+            inps.disp_unit = 'radian'
+
     # Data Operation - Display Unit & Rewrapping
     data, inps.disp_unit, inps.disp_scale, inps.wrap = pp.scale_data4disp_unit_and_rewrap(
         data,
