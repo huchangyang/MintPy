@@ -88,6 +88,12 @@ def create_parser(subparsers=None):
                       help='date(s) not included in time function estimation, i.e.:\n' +
                            '--exclude 20040502 20060708 20090103\n' +
                            '--exclude exclude_date.txt\n'+DROP_DATE_TXT)
+    date.add_argument('--allow-partial-date', dest='allowPartialDate', action='store_true',
+                      help='Use each pixel\'s finite acquisitions for time function estimation, '
+                           'allowing pixels with missing dates to be inverted (default: %(default)s).')
+    date.add_argument('--fit-coh-file', dest='fitCoherenceFile',
+                      help='Output file name for fit coherence from time-function residuals '
+                           '(default: fitCoherence.h5 when --allow-partial-date is enabled).')
 
     # Uncertainty quantification
     uq = parser.add_argument_group('Uncertainty quantification (UQ)', 'Estimating the time function parameters STD')
@@ -165,6 +171,9 @@ def cmd_line_parse(iargs=None):
             print('WARNING: NO time series covariance file found!')
             print('Change the uncertainty quantification method from covariance to residue, and continue.')
 
+    if inps.allowPartialDate and inps.uncertaintyQuantification != 'residue':
+        raise ValueError('--allow-partial-date currently supports --uq residue only!')
+
     # check: --ref-lalo option (translate to --ref-yx)
     if inps.ref_lalo:
         coord = ut.coordinate(atr)
@@ -208,6 +217,10 @@ def cmd_line_parse(iargs=None):
         inps.res_file = f'{os.path.splitext(inps.timeseries_file)[0]}_{suffix}.h5'
         print(f'output residual time series file: {inps.res_file}')
 
+    if inps.allowPartialDate and not inps.fitCoherenceFile:
+        out_dir = os.path.dirname(inps.outfile)
+        inps.fitCoherenceFile = os.path.join(out_dir, 'fitCoherence.h5') if out_dir else 'fitCoherence.h5'
+
     return inps
 
 
@@ -245,6 +258,9 @@ def read_template2inps(template_file, inps):
 
             elif key in ['uncertaintyQuantification', 'timeSeriesCovFile']:
                 iDict[key] = value
+
+            elif key in ['allowPartialDate']:
+                iDict[key] = value if isinstance(value, bool) else value.lower() in ['yes', 'true']
 
             elif key in ['polynomial', 'bootstrapCount']:
                 iDict[key] = int(value)
