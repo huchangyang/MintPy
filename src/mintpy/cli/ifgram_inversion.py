@@ -238,7 +238,10 @@ def read_template2inps(template_file, inps):
         if key in ['weightFunc', 'maskDataset', 'minNormVelocity']:
             iDict[key] = value
         elif key in ['allowPartialNetwork']:
-            iDict[key] = value.lower() in ['yes', 'true', '1']
+            if isinstance(value, bool):
+                iDict[key] = value
+            else:
+                iDict[key] = str(value).lower() in ['yes', 'true', '1']
         elif value:
             if key in ['maskThreshold', 'minRedundancy']:
                 iDict[key] = float(value)
