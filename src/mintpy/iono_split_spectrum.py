@@ -36,9 +36,10 @@ def run_iono_split_spectrum(inps):
 
     # 3. estimate iono time-series
     # hardwire "--dset unwrapPhase" to ignore dataset name change from unwrapping error correction options
+    # pass the template file so that network-inversion options (e.g. allowPartialNetwork) are respected
     print('\n'+'-'*80)
     print('Estimate ionospheric delay time-series via ifgram_inversion.py ...')
-    cmd = f'ifgram_inversion.py {inps.iono_stack_file} --dset unwrapPhase --weight-func no --update'
+    cmd = f'ifgram_inversion.py {inps.iono_stack_file} --dset unwrapPhase --weight-func no -t {inps.template_file} --update'
     print(cmd)
     ifgram_inversion.main(cmd.split()[1:])
 
