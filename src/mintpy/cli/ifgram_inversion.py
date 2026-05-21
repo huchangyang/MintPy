@@ -102,6 +102,12 @@ def create_parser(subparsers=None):
                       help='threshold to generate mask when mask is coherence (default: %(default)s).')
     mask.add_argument('--min-redun','--min-redundancy','--mr', dest='minRedundancy', metavar='NUM', type=float, default=1.0,
                       help='minimum redundancy of interferograms for every SAR acquisition. (default: %(default)s).')
+    mask.add_argument('--allow-partial-network', dest='allowPartialNetwork', action='store_true', default=False,
+                      help='Allow inversion for pixels where some SAR acquisitions have no valid\n'
+                           'interferograms (isolated dates). Those dates are filled with NaN in\n'
+                           'the output timeseries instead of masking out the entire pixel.\n'
+                           'For SBAS: long-baseline interferograms spanning isolated dates still\n'
+                           'constrain those epochs. (default: %(default)s).')
     # for offset ONLY
     #mask.add_argument('--mask-min-snr', dest='maskMinSNR', type=float, default=10.0,
     #                  help='minimum SNR to disable/ignore the threshold-based masking [for offset only].')
@@ -231,6 +237,8 @@ def read_template2inps(template_file, inps):
         value = template[key_prefix+key]
         if key in ['weightFunc', 'maskDataset', 'minNormVelocity']:
             iDict[key] = value
+        elif key in ['allowPartialNetwork']:
+            iDict[key] = value.lower() in ['yes', 'true', '1']
         elif value:
             if key in ['maskThreshold', 'minRedundancy']:
                 iDict[key] = float(value)

@@ -29,6 +29,7 @@ config_keys = [
     'maskThreshold',
     'minRedundancy',
     'minNormVelocity',
+    'allowPartialNetwork',
 ]
 
 
@@ -90,7 +91,7 @@ def run_or_skip(inps):
 ################################# Time-series Estimator ###################################
 def estimate_timeseries(A, B, y, tbase_diff, weight_sqrt=None, min_norm_velocity=True,
                         rcond=1e-5, min_redundancy=1., inv_quality_name='temporalCoherence',
-                        print_msg=True):
+                        allow_partial_network=False, print_msg=True):
     """Estimate time-series from a stack/network of interferograms with
     Least Square minimization on deformation phase / velocity.
 
@@ -117,24 +118,30 @@ def estimate_timeseries(A, B, y, tbase_diff, weight_sqrt=None, min_norm_velocity
         min_norm_velocity=True
         weight_sqrt=None
 
-    Parameters: A                 - 2D np.ndarray in size of (num_pair, num_date-1)
-                B                 - 2D np.ndarray in size of (num_pair, num_date-1),
-                                    design matrix B, each row represents differential temporal
-                                    baseline history between reference and secondary date of one interferogram
-                y                 - 2D np.ndarray in size of (num_pair, num_pixel),
-                                    phase/offset of all interferograms with no-data value: NaN.
-                tbase_diff        - 2D np.ndarray in size of (num_date-1, 1),
-                                    differential temporal baseline history, in the unit of years
-                weight_sqrt       - 2D np.ndarray in size of (num_pair, num_pixel),
-                                    square root of weight of all interferograms
-                min_norm_velocity - bool, assume minimum-norm deformation velocity, or not
-                rcond             - cut-off ratio of small singular values of A or B, to maintain robustness.
-                                    It's recommend to >= 1e-5 by experience, to generate reasonable result.
-                min_redundancy    - float, min redundancy defined as min num_pair for every SAR acquisition
-                inv_quality_name  - str, inversion quality type/name
-                                    temporalCoherence for phase
-                                    residual          for offset
-                                    no to turn OFF the calculation
+    Parameters: A                     - 2D np.ndarray in size of (num_pair, num_date-1)
+                B                     - 2D np.ndarray in size of (num_pair, num_date-1),
+                                        design matrix B, each row represents differential temporal
+                                        baseline history between reference and secondary date of one interferogram
+                y                     - 2D np.ndarray in size of (num_pair, num_pixel),
+                                        phase/offset of all interferograms with no-data value: NaN.
+                tbase_diff            - 2D np.ndarray in size of (num_date-1, 1),
+                                        differential temporal baseline history, in the unit of years
+                weight_sqrt           - 2D np.ndarray in size of (num_pair, num_pixel),
+                                        square root of weight of all interferograms
+                min_norm_velocity     - bool, assume minimum-norm deformation velocity, or not
+                rcond                 - cut-off ratio of small singular values of A or B, to maintain robustness.
+                                        It's recommend to >= 1e-5 by experience, to generate reasonable result.
+                min_redundancy        - float, min redundancy defined as min num_pair for every SAR acquisition
+                inv_quality_name      - str, inversion quality type/name
+                                        temporalCoherence for phase
+                                        residual          for offset
+                                        no to turn OFF the calculation
+                allow_partial_network - bool, if True, invert pixels with isolated dates (no valid
+                                        interferograms for some SAR acquisitions) and mark isolated
+                                        dates as NaN rather than skipping the entire pixel.
+                                        For SBAS: uses B-column connectivity; interferograms spanning
+                                        over isolated dates can still constrain those epochs.
+                                        For min-norm displacement: isolated dates are removed from A.
     Returns:    ts                - 2D np.ndarray in size of (num_date, num_pixel), phase time-series
                 inv_quality       - 1D np.ndarray in size of (num_pixel) or float, temporal coherence (for phase) or residual (for offset)
                 num_inv_obs       - 1D np.ndarray in size of (num_pixel) or int, number of observations (ifgrams / offsets)
@@ -158,9 +165,71 @@ def estimate_timeseries(A, B, y, tbase_diff, weight_sqrt=None, min_norm_velocity
     ##### skip invalid phase/offset value [NaN]
     y, [A, B, weight_sqrt] = skip_invalid_obs(y, mat_list=[A, B, weight_sqrt])
 
-    # check 1 - network redundancy: skip inversion if < threshold
-    if np.min(np.sum(A != 0., axis=0)) < min_redundancy:
-        return ts, inv_quality, num_inv_obs
+    # check 1 - network redundancy
+    a_col_sum = np.sum(A != 0., axis=0)
+
+    if allow_partial_network:
+        # identify isolated A columns (dates with no valid single-epoch connections)
+        isolated_A_flags = a_col_sum < min_redundancy
+
+        if min_norm_velocity:
+            # For SBAS: check B-column connectivity instead of A-column.
+            # Long-baseline interferograms spanning an isolated date still contribute
+            # non-zero entries in B, so those dates CAN be estimated via cumsum.
+            # Identify intervals where no interferogram provides any constraint at all.
+            b_col_sum = np.sum(np.abs(B), axis=0).ravel()
+            null_interval_flags = b_col_sum == 0
+
+            # A date k (k >= 1) cannot be estimated if any interval j < k has no valid
+            # observations (B column j == 0), since ts[k] = cumsum(v * dt) from date 0.
+            null_date_mask = np.zeros(num_date, dtype=np.bool_)
+            cumulative_null = False
+            for j in range(num_date - 1):
+                if null_interval_flags[j]:
+                    cumulative_null = True
+                if cumulative_null:
+                    null_date_mask[j + 1] = True
+            null_date_inds = np.where(null_date_mask)[0]
+
+            # find valid intervals prefix (before the first null interval)
+            if np.any(null_interval_flags):
+                first_null_interval = int(np.where(null_interval_flags)[0][0])
+            else:
+                first_null_interval = num_date - 1  # all intervals valid
+
+            # skip pixel if no valid interval at all
+            if first_null_interval == 0:
+                ts[null_date_inds, :] = np.nan
+                return ts, inv_quality, num_inv_obs
+
+            # reduce B and tbase_diff to the valid prefix of intervals
+            B_inv = B[:, :first_null_interval]
+            tbase_diff_inv = tbase_diff[:first_null_interval]
+
+            # remove rows where all valid-prefix B entries are zero (uninformative rows)
+            row_valid = np.any(B_inv != 0., axis=1)
+            if not np.any(row_valid):
+                ts[null_date_inds, :] = np.nan
+                return ts, inv_quality, num_inv_obs
+            B_inv = B_inv[row_valid, :]
+            y_inv = y[row_valid, :]
+            weight_sqrt_inv = weight_sqrt[row_valid, :] if weight_sqrt is not None else None
+
+        else:
+            # For min-norm displacement: remove isolated A columns.
+            valid_A_col_flags = ~isolated_A_flags
+            if not np.any(valid_A_col_flags):
+                return ts, inv_quality, num_inv_obs
+            valid_A_col_inds = np.where(valid_A_col_flags)[0]
+            A_inv = A[:, valid_A_col_inds]
+            y_inv = y
+            weight_sqrt_inv = weight_sqrt
+            null_date_inds = np.where(isolated_A_flags)[0] + 1
+
+    else:
+        # original behavior: skip entire pixel if any date is under-connected
+        if np.min(a_col_sum) < min_redundancy:
+            return ts, inv_quality, num_inv_obs
 
     # check 2 - matrix invertability (for WLS only because OLS contains it already)
     # Yunjun, Mar 2022: from my vague memory, a singular design matrix B returns error from scipy.linalg,
@@ -177,42 +246,89 @@ def estimate_timeseries(A, B, y, tbase_diff, weight_sqrt=None, min_norm_velocity
     try:
         if min_norm_velocity:
             ##### min-norm velocity
-            if weight_sqrt is not None:
-                X, e2 = linalg.lstsq(np.multiply(B, weight_sqrt),
-                                     np.multiply(y, weight_sqrt),
-                                     cond=rcond)[:2]
+            if allow_partial_network and np.any(null_date_mask):
+                # partial network: invert reduced B (valid interval prefix only)
+                if weight_sqrt_inv is not None:
+                    X, e2 = linalg.lstsq(np.multiply(B_inv, weight_sqrt_inv),
+                                         np.multiply(y_inv, weight_sqrt_inv),
+                                         cond=rcond)[:2]
+                else:
+                    X, e2 = linalg.lstsq(B_inv, y_inv, cond=rcond)[:2]
+
+                # calc inversion quality using the reduced system
+                if inv_quality_name != 'no':
+                    inv_quality = calc_inv_quality(B_inv, X, y_inv, e2,
+                                                   inv_quality_name=inv_quality_name,
+                                                   weight_sqrt=weight_sqrt_inv,
+                                                   print_msg=print_msg)
+
+                # assemble time-series for the valid prefix
+                ts_diff = X * np.tile(tbase_diff_inv, (1, num_pixel))
+                ts[1:first_null_interval + 1, :] = np.cumsum(ts_diff, axis=0)
+                # mark dates beyond the first broken interval as NaN
+                ts[null_date_inds, :] = np.nan
+
             else:
-                X, e2 = linalg.lstsq(B, y, cond=rcond)[:2]
+                # standard path (all intervals valid)
+                if weight_sqrt is not None:
+                    X, e2 = linalg.lstsq(np.multiply(B, weight_sqrt),
+                                         np.multiply(y, weight_sqrt),
+                                         cond=rcond)[:2]
+                else:
+                    X, e2 = linalg.lstsq(B, y, cond=rcond)[:2]
 
-            # calc inversion quality
-            if inv_quality_name != 'no':
-                inv_quality = calc_inv_quality(B, X, y, e2,
-                                               inv_quality_name=inv_quality_name,
-                                               weight_sqrt=weight_sqrt,
-                                               print_msg=print_msg)
+                # calc inversion quality
+                if inv_quality_name != 'no':
+                    inv_quality = calc_inv_quality(B, X, y, e2,
+                                                   inv_quality_name=inv_quality_name,
+                                                   weight_sqrt=weight_sqrt,
+                                                   print_msg=print_msg)
 
-            # assemble time-series
-            ts_diff = X * np.tile(tbase_diff, (1, num_pixel))
-            ts[1:, :] = np.cumsum(ts_diff, axis=0)
+                # assemble time-series
+                ts_diff = X * np.tile(tbase_diff, (1, num_pixel))
+                ts[1:, :] = np.cumsum(ts_diff, axis=0)
 
         else:
             ##### min-norm displacement
-            if weight_sqrt is not None:
-                X, e2 = linalg.lstsq(np.multiply(A, weight_sqrt),
-                                     np.multiply(y, weight_sqrt),
-                                     cond=rcond)[:2]
+            if allow_partial_network and np.any(isolated_A_flags):
+                # partial network: invert reduced A (isolated dates removed)
+                if weight_sqrt_inv is not None:
+                    X, e2 = linalg.lstsq(np.multiply(A_inv, weight_sqrt_inv),
+                                         np.multiply(y_inv, weight_sqrt_inv),
+                                         cond=rcond)[:2]
+                else:
+                    X, e2 = linalg.lstsq(A_inv, y_inv, cond=rcond)[:2]
+
+                # calc inversion quality using reduced system
+                if inv_quality_name != 'no':
+                    inv_quality = calc_inv_quality(A_inv, X, y_inv, e2,
+                                                   inv_quality_name=inv_quality_name,
+                                                   weight_sqrt=weight_sqrt_inv,
+                                                   print_msg=print_msg)
+
+                # assemble time-series: map valid dates back; isolated dates stay NaN
+                valid_date_inds = valid_A_col_inds + 1  # +1 because col j -> date j+1
+                ts[valid_date_inds, :] = X
+                ts[null_date_inds, :] = np.nan
+
             else:
-                X, e2 = linalg.lstsq(A, y, cond=rcond)[:2]
+                # standard path
+                if weight_sqrt is not None:
+                    X, e2 = linalg.lstsq(np.multiply(A, weight_sqrt),
+                                         np.multiply(y, weight_sqrt),
+                                         cond=rcond)[:2]
+                else:
+                    X, e2 = linalg.lstsq(A, y, cond=rcond)[:2]
 
-            # calc inversion quality
-            if inv_quality_name != 'no':
-                inv_quality = calc_inv_quality(A, X, y, e2,
-                                               inv_quality_name=inv_quality_name,
-                                               weight_sqrt=weight_sqrt,
-                                               print_msg=print_msg)
+                # calc inversion quality
+                if inv_quality_name != 'no':
+                    inv_quality = calc_inv_quality(A, X, y, e2,
+                                                   inv_quality_name=inv_quality_name,
+                                                   weight_sqrt=weight_sqrt,
+                                                   print_msg=print_msg)
 
-            # assemble time-series
-            ts[1: ,:] = X
+                # assemble time-series
+                ts[1: ,:] = X
 
     except linalg.LinAlgError:
         pass
@@ -595,21 +711,24 @@ def get_design_matrix4std(stack_obj):
 
 def run_ifgram_inversion_patch(ifgram_file, box=None, ref_phase=None, obs_ds_name='unwrapPhase',
                                weight_func='var', water_mask_file=None, min_norm_velocity=True,
-                               mask_ds_name=None, mask_threshold=0.4, min_redundancy=1.0, calc_cov=False):
+                               mask_ds_name=None, mask_threshold=0.4, min_redundancy=1.0,
+                               allow_partial_network=False, calc_cov=False):
     """Invert one patch of an ifgram stack into timeseries.
 
-    Parameters: ifgram_file       - str, interferograms stack HDF5 file, e.g. ./inputs/ifgramStack.h5
-                box               - tuple of 4 int, indicating (x0, y0, x1, y1) of the area of interest
-                                    Set to None for the whole image
-                ref_phase         - 1D array in size of (num_pair), or None
-                obs_ds_name       - str, dataset to feed the inversion.
-                weight_func       - str, weight function, choose in ['no', 'fim', 'var', 'coh']
-                water_mask_file   - str, water mask filename if available, to skip inversion on water
-                min_norm_velocity - bool, minimize the residual phase or phase velocity
-                mask_ds_name      - str, dataset name in ifgram_file used to mask unwrapPhase pixelwisely
-                mask_threshold    - float, min coherence of pixels if mask_dataset_name='coherence'
-                min_redundancy    - float, the min number of ifgrams for every acquisition.
-                calc_cov          - bool, calculate the time series covariance matrix.
+    Parameters: ifgram_file           - str, interferograms stack HDF5 file, e.g. ./inputs/ifgramStack.h5
+                box                   - tuple of 4 int, indicating (x0, y0, x1, y1) of the area of interest
+                                        Set to None for the whole image
+                ref_phase             - 1D array in size of (num_pair), or None
+                obs_ds_name           - str, dataset to feed the inversion.
+                weight_func           - str, weight function, choose in ['no', 'fim', 'var', 'coh']
+                water_mask_file       - str, water mask filename if available, to skip inversion on water
+                min_norm_velocity     - bool, minimize the residual phase or phase velocity
+                mask_ds_name          - str, dataset name in ifgram_file used to mask unwrapPhase pixelwisely
+                mask_threshold        - float, min coherence of pixels if mask_dataset_name='coherence'
+                min_redundancy        - float, the min number of ifgrams for every acquisition.
+                allow_partial_network - bool, allow inversion for pixels with isolated dates; mark
+                                        those dates as NaN instead of skipping the whole pixel.
+                calc_cov              - bool, calculate the time series covariance matrix.
     Returns:    ts                - 3D array in size of (num_date, num_row, num_col)
                 ts_cov            - 4D array in size of (num_date, num_date, num_row, num_col) or None
                 inv_quality       - 2D array in size of (num_row, num_col)
@@ -792,12 +911,13 @@ def run_ifgram_inversion_patch(ifgram_file, box=None, ref_phase=None, obs_ds_nam
 
     # common inversion options
     kwargs = {
-        'A'                 : A,
-        'B'                 : B,
-        'tbase_diff'        : tbase_diff,
-        'min_norm_velocity' : min_norm_velocity,
-        'min_redundancy'    : min_redundancy,
-        'inv_quality_name'  : inv_quality_name,
+        'A'                     : A,
+        'B'                     : B,
+        'tbase_diff'            : tbase_diff,
+        'min_norm_velocity'     : min_norm_velocity,
+        'min_redundancy'        : min_redundancy,
+        'inv_quality_name'      : inv_quality_name,
+        'allow_partial_network' : allow_partial_network,
     }
 
     # 2.2 un-weighted inversion (classic SBAS)
@@ -993,6 +1113,7 @@ def run_ifgram_inversion(inps):
     msg += f'minimum redundancy: {inps.minRedundancy}\n'
     msg += f'weight function: {inps.weightFunc}\n'
     msg += f'calculate covariance: {inps.calcCov} {ref_msg}\n'
+    msg += f'allow partial network: {inps.allowPartialNetwork}\n'
 
     if inps.maskDataset:
         if inps.maskDataset in ['connectComponent']:
@@ -1079,16 +1200,17 @@ def run_ifgram_inversion(inps):
 
     # 3.2 prepare the input arguments for *_patch()
     data_kwargs = {
-        "ifgram_file"       : inps.ifgramStackFile,
-        "ref_phase"         : inps.refPhase,
-        "obs_ds_name"       : inps.obsDatasetName,
-        "weight_func"       : inps.weightFunc,
-        "min_norm_velocity" : inps.minNormVelocity,
-        "water_mask_file"   : inps.waterMaskFile,
-        "mask_ds_name"      : inps.maskDataset,
-        "mask_threshold"    : inps.maskThreshold,
-        "min_redundancy"    : inps.minRedundancy,
-        "calc_cov"          : inps.calcCov,
+        "ifgram_file"           : inps.ifgramStackFile,
+        "ref_phase"             : inps.refPhase,
+        "obs_ds_name"           : inps.obsDatasetName,
+        "weight_func"           : inps.weightFunc,
+        "min_norm_velocity"     : inps.minNormVelocity,
+        "water_mask_file"       : inps.waterMaskFile,
+        "mask_ds_name"          : inps.maskDataset,
+        "mask_threshold"        : inps.maskThreshold,
+        "min_redundancy"        : inps.minRedundancy,
+        "allow_partial_network" : inps.allowPartialNetwork,
+        "calc_cov"              : inps.calcCov,
     }
 
     # 3.3 invert / write block-by-block
