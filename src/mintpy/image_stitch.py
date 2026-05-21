@@ -189,10 +189,16 @@ def stitch_two_matrices(mat1, atr1, mat2, atr2, apply_offset=True,
     print(f'update Y/X_FIRST: {N}/{W}')
 
     # update REF_Y/X
-    coord = ut.coordinate(atr)
-    ref_y, ref_x = coord.geo2radar(float(atr['REF_LAT']), float(atr['REF_LON']))[:2]
-    atr['REF_Y'], atr['REF_X'] = ref_y, ref_x
-    print(f'update REF_Y/X: {ref_y}/{ref_x}')
+    # For some geo files (e.g. geometryRadar.h5), there is no REF_LAT/REF_LON.
+    # Stitched pixel values do not require REF_Y/REF_X, so skip updating them
+    # when REF_LAT/REF_LON are missing.
+    if 'REF_LAT' in atr and 'REF_LON' in atr:
+        coord = ut.coordinate(atr)
+        ref_y, ref_x = coord.geo2radar(float(atr['REF_LAT']), float(atr['REF_LON']))[:2]
+        atr['REF_Y'], atr['REF_X'] = ref_y, ref_x
+        print(f'update REF_Y/X: {ref_y}/{ref_x}')
+    else:
+        print('WARNING: REF_LAT/REF_LON not found; skip updating REF_Y/REF_X for this stitched output')
 
     # delete SUBSET_Y/XMIN/MAX
     for key in ['SUBSET_XMIN', 'SUBSET_XMAX', 'SUBSET_YMIN', 'SUBSET_YMAX']:
