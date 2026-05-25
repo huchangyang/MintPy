@@ -982,6 +982,69 @@ def _date_centered_grid(dateList_dt):
     return grid_points
 
 
+def _format_month_year_axis(ax, dateList_dt, fontsize):
+    """Format time-axis coherence matrix with numeric month/year labels."""
+    min_date = min(dateList_dt)
+    max_date = max(dateList_dt)
+    if min_date.day > 1:
+        if min_date.month == 12:
+            current_date = min_date.replace(year=min_date.year+1, month=1, day=1)
+        else:
+            current_date = min_date.replace(month=min_date.month+1, day=1)
+    else:
+        current_date = min_date.replace(day=1)
+
+    tick_dates = []
+    while current_date <= max_date:
+        tick_dates.append(current_date)
+        if current_date.month == 12:
+            current_date = current_date.replace(year=current_date.year+1, month=1)
+        else:
+            current_date = current_date.replace(month=current_date.month+1)
+
+    tick_positions = mdates.date2num(tick_dates)
+    major_ticks = [pos for pos, date in zip(tick_positions, tick_dates) if date.month == 1]
+    minor_ticks = [pos for pos, date in zip(tick_positions, tick_dates) if date.month != 1]
+
+    ax.set_xticks(major_ticks)
+    ax.set_xticks(minor_ticks, minor=True)
+    ax.set_yticks(major_ticks)
+    ax.set_yticks(minor_ticks, minor=True)
+    ax.set_xticklabels([''] * len(major_ticks))
+    ax.set_xticklabels([''] * len(minor_ticks), minor=True)
+    ax.set_yticklabels([''] * len(major_ticks))
+    ax.set_yticklabels([''] * len(minor_ticks), minor=True)
+    ax.tick_params(which='major', direction='out', length=6, width=1.1,
+                   bottom=True, top=True, left=True, right=True)
+    ax.tick_params(which='minor', direction='out', length=3, width=1,
+                   bottom=True, top=True, left=True, right=True)
+
+    label_positions = []
+    month_labels = []
+    for i in range(len(tick_dates)-1):
+        if tick_dates[i].month % 2 == 1:
+            label_positions.append((tick_positions[i] + tick_positions[i+1]) / 2)
+            month_labels.append(str(tick_dates[i].month))
+
+    offset = (ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.03
+    year_offset = offset * 2.2
+    for pos, label in zip(label_positions, month_labels):
+        ax.text(pos, ax.get_ylim()[1] + offset, label,
+                horizontalalignment='center', verticalalignment='top', fontsize=fontsize)
+        ax.text(ax.get_xlim()[0] - offset, pos, label,
+                horizontalalignment='right', verticalalignment='center', fontsize=fontsize)
+
+    year_groups = {}
+    for i, date in enumerate(tick_dates):
+        year_groups.setdefault(date.year, []).append(tick_positions[i])
+    for year, positions in sorted(year_groups.items()):
+        pos = (positions[0] + positions[-1]) / 2
+        ax.text(pos, ax.get_ylim()[1] + year_offset, str(year),
+                horizontalalignment='center', verticalalignment='top', fontsize=fontsize)
+        ax.text(ax.get_xlim()[0] - year_offset, pos, str(year),
+                horizontalalignment='right', verticalalignment='center', fontsize=fontsize, rotation=90)
+
+
 def plot_coherence_matrix_time_axis(ax, date12List, cohList, date12List_drop=[], p_dict={}):
     """Plot Coherence Matrix with continuous time axis
     Parameters: ax : matplotlib.pyplot.Axes,
@@ -1046,16 +1109,9 @@ def plot_coherence_matrix_time_axis(ax, date12List, cohList, date12List_drop=[],
         zorder=0,
     )
 
-    locator = mdates.AutoDateLocator(minticks=3, maxticks=8)
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-    locator = mdates.AutoDateLocator(minticks=3, maxticks=8)
-    ax.yaxis.set_major_locator(locator)
-    ax.yaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    _format_month_year_axis(ax, dateList_dt, p_dict['fontsize'])
     ax.set_xlabel('Time', fontsize=p_dict['fontsize'])
     ax.set_ylabel('Time', fontsize=p_dict['fontsize'])
-    ax.tick_params(which='both', direction='out', labelsize=p_dict['fontsize'],
-                   bottom=True, top=True, left=True, right=True)
     ax.invert_yaxis()
 
     if p_dict['disp_title']:
