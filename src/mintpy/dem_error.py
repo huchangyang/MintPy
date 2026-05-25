@@ -22,6 +22,7 @@ config_keys = [
     'phaseVelocity',
     'stepDate',
     'excludeDate',
+    'allowPartialDate',
 ]
 
 # debug mode
@@ -93,6 +94,11 @@ def read_template2inps(template_file, inps):
         value = template[key_prefix+key]
         if key in ['phaseVelocity']:
             iDict[key] = value
+        elif key in ['allowPartialDate']:
+            if isinstance(value, bool):
+                iDict[key] = value
+            else:
+                iDict[key] = str(value).lower() in ['yes', 'true', '1']
         elif value:
             if key in ['polyOrder']:
                 iDict[key] = int(value)
@@ -280,8 +286,31 @@ def estimate_dem_error(ts0, G0, tbase, date_flag=None, phase_velocity=False,
     return delta_z, ts_cor, ts_res
 
 
+def _is_dem_error_system_invertible(G0, tbase, date_flag, phase_velocity=False):
+    """Check if the date-specific DEM error design matrix is solvable."""
+    if np.sum(date_flag) < 1:
+        return False
+
+    G = G0[date_flag, :]
+
+    if phase_velocity:
+        if np.sum(date_flag) < 2:
+            return False
+        tbase_diff = np.diff(tbase[date_flag], axis=0).reshape(-1, 1)
+        if np.any(tbase_diff == 0.):
+            return False
+        G = np.diff(G, axis=0) / np.repeat(tbase_diff, G.shape[1], axis=1)
+        G = np.hstack((G[:, :1], G[:, 2:]))
+
+    if G.shape[0] < G.shape[1]:
+        return False
+
+    return np.linalg.matrix_rank(G) >= G.shape[1]
+
+
 def correct_dem_error_patch(G_defo, ts_file, geom_file=None, box=None,
-                            date_flag=None, phase_velocity=False):
+                            date_flag=None, phase_velocity=False,
+                            allow_partial_date=False):
     """
     Correct one path of a time-series for DEM error.
 
@@ -291,6 +320,8 @@ def correct_dem_error_patch(G_defo, ts_file, geom_file=None, box=None,
                 box            - tuple of 4 int in (x0, y0, x1, y1) for the area of interest
                 date_flag      - 1D np.ndarray in bool in size of (num_date), dates used for the estimation
                 phase_velocity - bool, minimize the resdiual phase or phase velocity
+                allow_partial_date - bool, allow DEM error estimation for pixels with
+                                    partial-date NaN observations using valid dates only.
     Returns:    delta_z        - 2D np.ndarray in size of (num_row, num_col)
                 ts_cor         - 3D np.ndarray in size of (num_date, num_row, num_col)
                 ts_res         - 3D np.ndarray in size of (num_date, num_row, num_col)
@@ -329,8 +360,12 @@ def correct_dem_error_patch(G_defo, ts_file, geom_file=None, box=None,
     print('skip pixels with ZERO in ALL acquisitions')
     mask = np.nanmean(ts_data, axis=0) != 0.
 
-    print('skip pixels with NaN  in ANY acquisitions')
-    mask *= np.sum(np.isnan(ts_data), axis=0) == 0
+    if allow_partial_date:
+        print('allow pixels with NaN in SOME acquisitions for DEM error estimation')
+        mask *= np.any(~np.isnan(ts_data[date_flag, :]), axis=0)
+    else:
+        print('skip pixels with NaN  in ANY acquisitions')
+        mask *= np.sum(np.isnan(ts_data), axis=0) == 0
 
     tcoh_file = os.path.join(os.path.dirname(ts_file), 'temporalCoherence.h5')
     if os.path.isfile(tcoh_file):
@@ -372,23 +407,73 @@ def correct_dem_error_patch(G_defo, ts_file, geom_file=None, box=None,
         G_geom = pbase / (range_dist * sin_inc_angle)
         G = np.hstack((G_geom, G_defo))
 
-        # run
-        delta_z_i, ts_cor_i, ts_res_i = estimate_dem_error(
-            ts0=ts_data[:, mask],
-            G0=G,
-            tbase=tbase,
-            date_flag=date_flag,
-            phase_velocity=phase_velocity,
-        )
+        if allow_partial_date:
+            mask_all_date = mask * (np.sum(np.isnan(ts_data[date_flag, :]), axis=0) == 0)
+            mask_part_date = mask ^ mask_all_date
 
-        # assemble
-        delta_z[mask] = delta_z_i
-        ts_cor[:, mask] = ts_cor_i
-        ts_res[:, mask] = ts_res_i
+            if np.sum(mask_all_date) > 0:
+                # run vectorized estimation for pixels with all valid estimation dates
+                delta_z_i, ts_cor_i, ts_res_i = estimate_dem_error(
+                    ts0=ts_data[:, mask_all_date],
+                    G0=G,
+                    tbase=tbase,
+                    date_flag=date_flag,
+                    phase_velocity=phase_velocity,
+                )
+
+                # assemble
+                delta_z[mask_all_date] = delta_z_i
+                ts_cor[:, mask_all_date] = ts_cor_i
+                ts_res[:, mask_all_date] = ts_res_i
+
+            if np.sum(mask_part_date) > 0:
+                num_pixel2inv_part = int(np.sum(mask_part_date))
+                idx_pixel2inv_part = np.where(mask_part_date)[0]
+                num_pixel_skip = 0
+                print(f'estimating DEM error for pixels with partial-date observations ({num_pixel2inv_part} pixels) ...')
+                prog_bar = ptime.progressBar(maxValue=num_pixel2inv_part)
+                for i in range(num_pixel2inv_part):
+                    idx = idx_pixel2inv_part[i]
+                    date_flag_i = date_flag * ~np.isnan(ts_data[:, idx])
+                    if not _is_dem_error_system_invertible(G, tbase, date_flag_i, phase_velocity):
+                        num_pixel_skip += 1
+                        prog_bar.update(i+1, every=2000, suffix=f'{i+1}/{num_pixel2inv_part}')
+                        continue
+
+                    delta_z_i, ts_cor_i, ts_res_i = estimate_dem_error(
+                        ts0=ts_data[:, idx],
+                        G0=G,
+                        tbase=tbase,
+                        date_flag=date_flag_i,
+                        phase_velocity=phase_velocity,
+                    )
+
+                    delta_z[idx] = delta_z_i
+                    ts_cor[:, idx] = ts_cor_i.flatten()
+                    ts_res[:, idx] = ts_res_i.flatten()
+                    prog_bar.update(i+1, every=2000, suffix=f'{i+1}/{num_pixel2inv_part}')
+                prog_bar.close()
+                print(f'number of partial-date pixels skipped due to insufficient observations/rank: {num_pixel_skip}')
+
+        else:
+            # run
+            delta_z_i, ts_cor_i, ts_res_i = estimate_dem_error(
+                ts0=ts_data[:, mask],
+                G0=G,
+                tbase=tbase,
+                date_flag=date_flag,
+                phase_velocity=phase_velocity,
+            )
+
+            # assemble
+            delta_z[mask] = delta_z_i
+            ts_cor[:, mask] = ts_cor_i
+            ts_res[:, mask] = ts_res_i
 
     else:
         print('estimating DEM error pixel-wisely ...')
         prog_bar = ptime.progressBar(maxValue=num_pixel2inv)
+        num_pixel_skip = 0
         for i in range(num_pixel2inv):
             idx = idx_pixel2inv[i]
 
@@ -400,13 +485,20 @@ def correct_dem_error_patch(G_defo, ts_file, geom_file=None, box=None,
 
             G_geom = pbase_i / (range_dist[idx] * sin_inc_angle[idx])
             G = np.hstack((G_geom, G_defo))
+            date_flag_i = date_flag
+            if allow_partial_date:
+                date_flag_i = date_flag * ~np.isnan(ts_data[:, idx])
+                if not _is_dem_error_system_invertible(G, tbase, date_flag_i, phase_velocity):
+                    num_pixel_skip += 1
+                    prog_bar.update(i+1, every=2000, suffix=f'{i+1}/{num_pixel2inv}')
+                    continue
 
             # run
             delta_z_i, ts_cor_i, ts_res_i = estimate_dem_error(
                 ts0=ts_data[:, idx],
                 G0=G,
                 tbase=tbase,
-                date_flag=date_flag,
+                date_flag=date_flag_i,
                 phase_velocity=phase_velocity,
             )
 
@@ -417,6 +509,8 @@ def correct_dem_error_patch(G_defo, ts_file, geom_file=None, box=None,
 
             prog_bar.update(i+1, every=2000, suffix=f'{i+1}/{num_pixel2inv}')
         prog_bar.close()
+        if allow_partial_date:
+            print(f'number of partial-date pixels skipped due to insufficient observations/rank: {num_pixel_skip}')
     del ts_data, pbase
 
     ## 3. prepare output
@@ -500,11 +594,12 @@ def correct_dem_error(inps):
 
     # 3.2 prepare the input arguments for *_patch()
     data_kwargs = {
-        'G_defo'         : G_defo,
-        'ts_file'        : inps.ts_file,
-        'geom_file'      : inps.geom_file,
-        'date_flag'      : date_flag,
-        'phase_velocity' : inps.phaseVelocity,
+        'G_defo'             : G_defo,
+        'ts_file'            : inps.ts_file,
+        'geom_file'          : inps.geom_file,
+        'date_flag'          : date_flag,
+        'phase_velocity'     : inps.phaseVelocity,
+        'allow_partial_date' : inps.allowPartialDate,
     }
 
     # 3.3 invert / write block-by-block
