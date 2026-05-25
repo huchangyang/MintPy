@@ -1110,8 +1110,8 @@ def plot_coherence_matrix_time_axis(ax, date12List, cohList, date12List_drop=[],
     )
 
     _format_month_year_axis(ax, dateList_dt, p_dict['fontsize'])
-    ax.set_xlabel('Time', fontsize=p_dict['fontsize'], labelpad=30)
-    ax.set_ylabel('Time', fontsize=p_dict['fontsize'], labelpad=30)
+    ax.set_xlabel('Time', fontsize=p_dict['fontsize'], labelpad=18)
+    ax.set_ylabel('Time', fontsize=p_dict['fontsize'], labelpad=18)
     ax.invert_yaxis()
 
     if p_dict['disp_title']:

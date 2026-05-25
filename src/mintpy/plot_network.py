@@ -230,6 +230,7 @@ def plot_network(inps):
             inps.date12List_drop,
             p_dict=vars(inps),
         )[0]
+        fig.tight_layout()
         if inps.save_fig:
             fig.savefig(fig_names[3], **kwargs)
             print(f'save figure to {fig_names[3]}')
