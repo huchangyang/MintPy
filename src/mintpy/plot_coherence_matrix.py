@@ -110,17 +110,6 @@ class coherenceMatrixViewer():
                 self.figsize_mat = [10, 8]
             vprint(f'create matrix figure in size of {self.figsize_mat} inches')
 
-        if not hasattr(self, 'cmap_name'):
-            # Default colormap: use 'RdBu_truncate' for both timeaxis and normal mode (from CLI default)
-            # This matches the CLI default value
-            if self.time_axis:
-                self.cmap_name = 'RdBu_truncate'
-            else:
-                self.cmap_name = 'viridis'
-        if not hasattr(self, 'cmap_vlist'):
-            self.cmap_vlist = [0.0, 1.0]
-        self.colormap = pp.ColormapExt(self.cmap_name, vlist=self.cmap_vlist).colormap
-
         # read aux data
         # 1. temporal coherence value
         self.tcoh = None
@@ -143,6 +132,7 @@ class coherenceMatrixViewer():
 
         # Figure 2 - Coherence Matrix
         self.fig_mat, self.ax_mat = plt.subplots(num=self.figname_mat, figsize=self.figsize_mat)
+        self.colormap = pp.ColormapExt(self.cmap_name, vlist=self.cmap_vlist).colormap
         if all(i is not None for i in self.yx):
             self.plot_coherence_matrix4pixel(self.yx)
 
