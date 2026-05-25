@@ -1057,8 +1057,8 @@ def plot_coherence_matrix_time_axis(ax, date12List, cohList, date12List_drop=[],
         all_dates.add(d2)
     date_list = sorted(list(all_dates))
 
-    # Create a date-centered continuous time grid: each acquisition date is
-    # the center of one cell and adjacent cell boundaries are date midpoints.
+    # Create a date-centered continuous time grid. Internal cell boundaries
+    # are date midpoints, while end cells extend by the adjacent date spacing.
     if len(date_list) == 1:
         half_width = timedelta(days=15)
         grid_points = [date_list[0] - half_width, date_list[0] + half_width]
@@ -1066,12 +1066,12 @@ def plot_coherence_matrix_time_axis(ax, date12List, cohList, date12List_drop=[],
         lefts, rights = [], []
         for i, date in enumerate(date_list):
             if i == 0:
-                left_i = date - (date_list[1] - date) / 2
+                left_i = date - (date_list[1] - date)
             else:
                 left_i = date - (date - date_list[i-1]) / 2
 
             if i == len(date_list) - 1:
-                right_i = date + (date - date_list[i-1]) / 2
+                right_i = date + (date - date_list[i-1])
             else:
                 right_i = date + (date_list[i+1] - date) / 2
 
