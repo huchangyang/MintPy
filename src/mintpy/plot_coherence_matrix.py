@@ -72,6 +72,8 @@ class coherenceMatrixViewer():
         self.fig_mat = None
         self.ax_mat = None
 
+        self.time_axis = getattr(inps, 'time_axis', False)
+
         # copy inps to self object
         for key, value in inps.__dict__.items():
             setattr(self, key, value)
@@ -108,6 +110,17 @@ class coherenceMatrixViewer():
                 self.figsize_mat = [10, 8]
             vprint(f'create matrix figure in size of {self.figsize_mat} inches')
 
+        if not hasattr(self, 'cmap_name'):
+            # Default colormap: use 'RdBu_truncate' for both timeaxis and normal mode (from CLI default)
+            # This matches the CLI default value
+            if self.time_axis:
+                self.cmap_name = 'RdBu_truncate'
+            else:
+                self.cmap_name = 'viridis'
+        if not hasattr(self, 'cmap_vlist'):
+            self.cmap_vlist = [0.0, 1.0]
+        self.colormap = pp.ColormapExt(self.cmap_name, vlist=self.cmap_vlist).colormap
+
         # read aux data
         # 1. temporal coherence value
         self.tcoh = None
@@ -130,7 +143,6 @@ class coherenceMatrixViewer():
 
         # Figure 2 - Coherence Matrix
         self.fig_mat, self.ax_mat = plt.subplots(num=self.figname_mat, figsize=self.figsize_mat)
-        self.colormap = pp.ColormapExt(self.cmap_name, vlist=self.cmap_vlist).colormap
         if all(i is not None for i in self.yx):
             self.plot_coherence_matrix4pixel(self.yx)
 
@@ -167,12 +179,75 @@ class coherenceMatrixViewer():
 
         self.fig_img.canvas.manager.set_window_title(self.figname_img)
         self.fig_img.tight_layout()
+
+    def plot_coherence_matrix4pixel_time_axis(self, yx):
+        """Plot coherence matrix with continuous time axis for one pixel
+        Parameters: yx : list of 2 int
+        """
+        self.ax_mat.cla()
+
+        # read coherence
+        box = (yx[1], yx[0], yx[1]+1, yx[0]+1)
+        coh = readfile.read(self.ifgram_file, datasetName='coherence', box=box)[0]
+
+        # ex_date for pixel-wise masking during network inversion
+        ex_date12_list = self.ex_date12_list[:]   #local copy
+        if self.min_coh_used > 0.:
+            ex_date12_list += np.array(self.date12_list)[coh < self.min_coh_used].tolist()
+            ex_date12_list = sorted(list(set(ex_date12_list)))
+
+        # prep metadata
+        plotDict = {}
+        plotDict['fig_title'] = f'Y = {yx[0]}, X = {yx[1]}'
+        # display temporal coherence value of the pixel
+        if self.tcoh_file:
+            tcoh = self.tcoh[yx[0], yx[1]]
+            plotDict['fig_title'] += f', tcoh = {tcoh:.2f}'
+        plotDict['colormap'] = self.colormap
+        # cmap_vlist is [start, jump, end] for truncated colormap, but vlim needs [vmin, vmax]
+        if len(self.cmap_vlist) >= 2:
+            plotDict['vlim'] = [self.cmap_vlist[0], self.cmap_vlist[-1]]
+        else:
+            plotDict['vlim'] = [0.0, 1.0]
+        plotDict['cbar_label'] = 'Coherence'
+        plotDict['disp_legend'] = False
+
+        # plot using the utility function
+        _, _ = pp.plot_coherence_matrix_time_axis(
+            self.ax_mat,
+            date12List=self.date12_list,
+            cohList=coh.tolist(),
+            date12List_drop=ex_date12_list,
+            p_dict=plotDict,
+        )[1:3]
+
+        # Info
+        msg = f'pixel in yx = {tuple(yx)}, '
+        msg += f'min/max spatial coherence: {np.nanmin(coh):.2f} / {np.nanmax(coh):.2f}, '
+        if self.tcoh_file:
+            tcoh = self.tcoh[yx[0], yx[1]]
+            msg += f'temporal coherence: {tcoh:.2f}'
+        vprint(msg)
+
+        self.ax_mat.annotate('ifgrams\navailable', xy=(0.05, 0.05), xycoords='axes fraction', fontsize=12)
+        self.ax_mat.annotate('ifgrams\nused', ha='right', xy=(0.95, 0.85), xycoords='axes fraction', fontsize=12)
+
+        self.fig_mat.canvas.manager.set_window_title(self.figname_mat)
+        self.fig_mat.tight_layout()
+
+        # Update figure
+        self.fig_mat.canvas.draw_idle()
+        self.fig_mat.canvas.flush_events()
         return
 
     def plot_coherence_matrix4pixel(self, yx):
         """Plot coherence matrix for one pixel
         Parameters: yx : list of 2 int
         """
+        # Use time axis mode if enabled
+        if self.time_axis:
+            return self.plot_coherence_matrix4pixel_time_axis(yx)
+
         self.ax_mat.cla()
 
         # read coherence
@@ -241,7 +316,6 @@ class coherenceMatrixViewer():
                       int(event.xdata+0.5)]
             self.plot_coherence_matrix4pixel(yx)
             self.update_image_marker(yx)
-
         elif event.inaxes == self.ax_mat:
             pass
 
