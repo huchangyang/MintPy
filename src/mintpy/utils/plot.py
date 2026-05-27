@@ -959,6 +959,196 @@ def plot_coherence_matrix(ax, date12List, cohList, date12List_drop=[], p_dict={}
     return ax, coh_mat, im
 
 
+def _date_list_from_date12(date12List):
+    """Get sorted acquisition dates as strings and datetime objects."""
+    m_dates = [i.split('_')[0] for i in date12List]
+    s_dates = [i.split('_')[1] for i in date12List]
+    dateList = sorted(list(set(m_dates + s_dates)))
+    dateList = ptime.yyyymmdd(dateList)
+    dateList_dt = [dt.datetime.strptime(i, '%Y%m%d') for i in dateList]
+    return dateList, dateList_dt
+
+
+def _date_centered_grid(dateList_dt):
+    """Build cell edges centered on acquisition dates."""
+    if len(dateList_dt) == 1:
+        half_width = dt.timedelta(days=15)
+        return [dateList_dt[0] - half_width, dateList_dt[0] + half_width]
+
+    grid_points = [dateList_dt[0] - (dateList_dt[1] - dateList_dt[0])]
+    for date1, date2 in zip(dateList_dt[:-1], dateList_dt[1:]):
+        grid_points.append(date1 + (date2 - date1) / 2)
+    grid_points.append(dateList_dt[-1] + (dateList_dt[-1] - dateList_dt[-2]))
+    return grid_points
+
+
+def _format_month_year_axis(ax, dateList_dt, fontsize):
+    """Format time-axis coherence matrix with numeric month/year labels."""
+    min_date = min(dateList_dt)
+    max_date = max(dateList_dt)
+    if min_date.day > 1:
+        if min_date.month == 12:
+            current_date = min_date.replace(year=min_date.year+1, month=1, day=1)
+        else:
+            current_date = min_date.replace(month=min_date.month+1, day=1)
+    else:
+        current_date = min_date.replace(day=1)
+
+    tick_dates = []
+    while current_date <= max_date:
+        tick_dates.append(current_date)
+        if current_date.month == 12:
+            current_date = current_date.replace(year=current_date.year+1, month=1)
+        else:
+            current_date = current_date.replace(month=current_date.month+1)
+
+    tick_positions = mdates.date2num(tick_dates)
+    major_ticks = [pos for pos, date in zip(tick_positions, tick_dates) if date.month == 1]
+    minor_ticks = [pos for pos, date in zip(tick_positions, tick_dates) if date.month != 1]
+
+    ax.set_xticks(major_ticks)
+    ax.set_xticks(minor_ticks, minor=True)
+    ax.set_yticks(major_ticks)
+    ax.set_yticks(minor_ticks, minor=True)
+    ax.set_xticklabels([''] * len(major_ticks))
+    ax.set_xticklabels([''] * len(minor_ticks), minor=True)
+    ax.set_yticklabels([''] * len(major_ticks))
+    ax.set_yticklabels([''] * len(minor_ticks), minor=True)
+    ax.tick_params(which='major', direction='out', length=6, width=1.1,
+                   bottom=True, top=True, left=True, right=True)
+    ax.tick_params(which='minor', direction='out', length=3, width=1,
+                   bottom=True, top=True, left=True, right=True)
+
+    label_positions = []
+    month_labels = []
+    for i in range(len(tick_dates)-1):
+        if tick_dates[i].month % 2 == 1:
+            label_positions.append((tick_positions[i] + tick_positions[i+1]) / 2)
+            month_labels.append(str(tick_dates[i].month))
+
+    offset = (ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.03
+    year_offset = offset * 2.2
+    for pos, label in zip(label_positions, month_labels):
+        ax.text(pos, ax.get_ylim()[1] + offset, label,
+                horizontalalignment='center', verticalalignment='top', fontsize=fontsize)
+        ax.text(ax.get_xlim()[0] - offset, pos, label,
+                horizontalalignment='right', verticalalignment='center', fontsize=fontsize)
+
+    year_groups = {}
+    for i, date in enumerate(tick_dates):
+        year_groups.setdefault(date.year, []).append(tick_positions[i])
+    for year, positions in sorted(year_groups.items()):
+        pos = (positions[0] + positions[-1]) / 2
+        ax.text(pos, ax.get_ylim()[1] + year_offset, str(year),
+                horizontalalignment='center', verticalalignment='top', fontsize=fontsize)
+        ax.text(ax.get_xlim()[0] - year_offset, pos, str(year),
+                horizontalalignment='right', verticalalignment='center', fontsize=fontsize, rotation=90)
+
+
+def plot_coherence_matrix_time_axis(ax, date12List, cohList, date12List_drop=[], p_dict={}):
+    """Plot Coherence Matrix with continuous time axis
+    Parameters: ax : matplotlib.pyplot.Axes,
+                date12List : list of date12 in YYYYMMDD_YYYYMMDD format
+                cohList    : list of float, coherence value
+                date12List_drop : list of date12 for date12 marked as dropped
+                p_dict  : dict of plot setting
+    Returns:    ax : matplotlib.pyplot.Axes
+                coh_mat : 2D np.array in size of [num_date, num_date]
+                mesh : matplotlib.collections.QuadMesh object
+    """
+    # Figure Setting
+    if 'ds_name'     not in p_dict.keys():   p_dict['ds_name']     = 'Coherence'
+    if 'fontsize'    not in p_dict.keys():   p_dict['fontsize']    = 12
+    if 'disp_title'  not in p_dict.keys():   p_dict['disp_title']  = True
+    if 'fig_title'   not in p_dict.keys():   p_dict['fig_title']   = '{} Matrix'.format(p_dict['ds_name'])
+    if 'colormap'    not in p_dict.keys():   p_dict['colormap']    = 'RdBu_truncate'
+    if 'cbar_label'  not in p_dict.keys():   p_dict['cbar_label']  = p_dict['ds_name']
+    if 'vlim'        not in p_dict.keys():   p_dict['vlim']        = (0.2, 1.0)
+    if 'disp_cbar'   not in p_dict.keys():   p_dict['disp_cbar']   = True
+    if 'legend_loc'  not in p_dict.keys():   p_dict['legend_loc']  = 'best'
+    if 'disp_legend' not in p_dict.keys():   p_dict['disp_legend'] = True
+
+    # support input colormap: string for colormap name, or colormap object directly
+    if isinstance(p_dict['colormap'], str):
+        cmap = ColormapExt(p_dict['colormap']).colormap
+    elif isinstance(p_dict['colormap'], mpl.colors.LinearSegmentedColormap):
+        cmap = p_dict['colormap']
+    else:
+        raise ValueError('unrecognized colormap input: {}'.format(p_dict['colormap']))
+
+    date12List = ptime.yyyymmdd_date12(date12List)
+    date12List_drop = ptime.yyyymmdd_date12(date12List_drop) if date12List_drop else []
+    dateList, dateList_dt = _date_list_from_date12(date12List)
+    coh_mat = pnet.coherence_matrix(date12List, cohList)
+
+    if date12List_drop:
+        # Set dropped pairs' value to nan in upper triangle only.
+        for date12 in date12List_drop:
+            idx1, idx2 = (dateList.index(i) for i in date12.split('_'))
+            coh_mat[idx1, idx2] = np.nan
+
+    grid_points = _date_centered_grid(dateList_dt)
+    grid_nums = mdates.date2num(grid_points)
+    X, Y = np.meshgrid(grid_nums, grid_nums)
+
+    # Show diagonal value as black, to be distinguished from un-selected interferograms.
+    diag_mat = np.diag(np.ones(coh_mat.shape[0]))
+    diag_mat[diag_mat == 0.] = np.nan
+    ax.pcolormesh(X, Y, diag_mat, cmap='gray_r', vmin=0.0, vmax=1.0, shading='auto', zorder=1)
+
+    cmap_plot = cmap.copy()
+    cmap_plot.set_bad('white')
+    mesh = ax.pcolormesh(
+        X,
+        Y,
+        coh_mat,
+        cmap=cmap_plot,
+        vmin=p_dict['vlim'][0],
+        vmax=p_dict['vlim'][1],
+        shading='auto',
+        zorder=0,
+    )
+
+    _format_month_year_axis(ax, dateList_dt, p_dict['fontsize'])
+    ax.set_xlabel('Time', fontsize=p_dict['fontsize'], labelpad=18)
+    ax.set_ylabel('Time', fontsize=p_dict['fontsize'], labelpad=18)
+    ax.set_aspect('equal', adjustable='box')
+    ax.invert_yaxis()
+
+    if p_dict['disp_title']:
+        ax.set_title(p_dict['fig_title'], fontsize=p_dict['fontsize'])
+
+    # Colorbar
+    if p_dict['disp_cbar']:
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", "3%", pad="3%")
+        cbar = plt.colorbar(mesh, cax=cax)
+        cbar.set_label(p_dict['cbar_label'], fontsize=p_dict['fontsize'])
+
+    # Legend
+    if date12List_drop and p_dict['disp_legend']:
+        ax.plot([], [], label='Upper: Ifgrams used')
+        ax.plot([], [], label='Lower: Ifgrams all')
+        ax.legend(loc=p_dict['legend_loc'], handlelength=0)
+
+    # Status bar
+    def format_coord(x, y):
+        col = np.searchsorted(grid_nums, x, side='right') - 1
+        row = np.searchsorted(grid_nums, y, side='right') - 1
+        if 0 <= row < len(dateList_dt) and 0 <= col < len(dateList_dt):
+            date1 = dateList_dt[col].strftime('%Y-%m-%d')
+            date2 = dateList_dt[row].strftime('%Y-%m-%d')
+            coh_val = coh_mat[row, col]
+            if not np.isnan(coh_val):
+                return f'x={date1}, y={date2}, v={coh_val:.3f}'
+            return f'x={date1}, y={date2}, v=NaN'
+        return ''
+
+    ax.format_coord = format_coord
+
+    return ax, coh_mat, mesh
+
+
 def plot_num_triplet_with_nonzero_integer_ambiguity(fname, disp_fig=False, font_size=12, fig_size=[9,3]):
     """Plot the histogram for the number of triplets with non-zero integer ambiguity.
 
