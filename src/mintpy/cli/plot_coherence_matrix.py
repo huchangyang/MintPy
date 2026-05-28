@@ -10,6 +10,7 @@ import os
 import sys
 
 from mintpy.utils.arg_utils import create_argument_parser
+from mintpy.utils import readfile
 
 ###########################  Sub Function  #############################
 EXAMPLE = """example:
@@ -26,6 +27,11 @@ EXAMPLE = """example:
   # show color jump same as the coherence threshold in network inversion with pixel-wised masking
   plot_coherence_matrix.py inputs/ifgramStack.h5 --cmap-vlist 0 0.4 1
 """
+
+
+def arg_is_set(argv, opt):
+    """Check whether an optional argument is set from command line."""
+    return any(i == opt or i.startswith(f'{opt}=') for i in argv)
 
 
 def create_parser(subparsers=None):
@@ -85,8 +91,18 @@ def cmd_line_parse(iargs=None):
 
     # default: auxiliary file paths (velocity and template)
     mintpy_dir = os.path.dirname(os.path.dirname(inps.ifgram_file))
+    atr = readfile.read_attribute(inps.ifgram_file)
+    is_geo = 'Y_FIRST' in atr
     if not inps.img_file:
-        inps.img_file = os.path.join(mintpy_dir, 'velocity.h5')
+        img_files = [os.path.join(mintpy_dir, 'velocity.h5')]
+        if is_geo:
+            img_files.insert(0, os.path.join(mintpy_dir, 'geo', 'geo_velocity.h5'))
+        inps.img_file = next((i for i in img_files if os.path.isfile(i)), img_files[0])
+    if not arg_is_set(inps.argv, '--tcoh'):
+        tcoh_files = [os.path.join(mintpy_dir, 'temporalCoherence.h5')]
+        if is_geo:
+            tcoh_files.insert(0, os.path.join(mintpy_dir, 'geo', 'geo_temporalCoherence.h5'))
+        inps.tcoh_file = next((i for i in tcoh_files if os.path.isfile(i)), tcoh_files[0])
     if not inps.template_file:
         inps.template_file = os.path.join(mintpy_dir, 'smallbaselineApp.cfg')
 
@@ -117,7 +133,8 @@ def main(iargs=None):
     obj = coherenceMatrixViewer(inps)
     obj.open()
     obj.plot()
-    obj.fig.canvas.mpl_disconnect(obj.cid)
+    obj.fig_img.canvas.mpl_disconnect(obj.cid_img)
+    obj.fig_mat.canvas.mpl_disconnect(obj.cid_mat)
 
 
 ############################################################

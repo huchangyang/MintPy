@@ -28,6 +28,7 @@ def read_network_info(inps):
     date12_kept = obj.get_date12_list(dropIfgram=True)
     inps.ex_date12_list = sorted(list(set(inps.date12_list) - set(date12_kept)))
     inps.date_list = obj.get_date_list(dropIfgram=False)
+    inps.ifgram_shape = (int(obj.metadata['LENGTH']), int(obj.metadata['WIDTH']))
     vprint(f'number of all     interferograms: {len(inps.date12_list)}')
     vprint(f'number of dropped interferograms: {len(inps.ex_date12_list)}')
     vprint(f'number of kept    interferograms: {len(inps.date12_list) - len(inps.ex_date12_list)}')
@@ -115,6 +116,12 @@ class coherenceMatrixViewer():
         self.tcoh = None
         if self.tcoh_file:
             self.tcoh = readfile.read(self.tcoh_file)[0]
+            if self.tcoh.shape != self.ifgram_shape:
+                msg = f'WARNING: {self.tcoh_file} has shape {self.tcoh.shape}, '
+                msg += f'not matching ifgramStack shape {self.ifgram_shape}; ignore it.'
+                print(msg)
+                self.tcoh = None
+                self.tcoh_file = None
         # 2. minimum used coherence from template file
         self.min_coh_used = 0.0
         if self.template_file:
@@ -190,8 +197,8 @@ class coherenceMatrixViewer():
         plotDict = {}
         plotDict['fig_title'] = f'Y = {yx[0]}, X = {yx[1]}'
         # display temporal coherence value of the pixel
-        if self.tcoh_file:
-            tcoh = self.tcoh[yx[0], yx[1]]
+        tcoh = self.get_temporal_coherence(yx)
+        if tcoh is not None:
             plotDict['fig_title'] += f', tcoh = {tcoh:.2f}'
         plotDict['colormap'] = self.colormap
         # cmap_vlist is [start, jump, end] for truncated colormap, but vlim needs [vmin, vmax]
@@ -214,8 +221,7 @@ class coherenceMatrixViewer():
         # Info
         msg = f'pixel in yx = {tuple(yx)}, '
         msg += f'min/max spatial coherence: {np.nanmin(coh):.2f} / {np.nanmax(coh):.2f}, '
-        if self.tcoh_file:
-            tcoh = self.tcoh[yx[0], yx[1]]
+        if tcoh is not None:
             msg += f'temporal coherence: {tcoh:.2f}'
         vprint(msg)
 
@@ -254,8 +260,8 @@ class coherenceMatrixViewer():
         plotDict = {}
         plotDict['fig_title'] = f'Y = {yx[0]}, X = {yx[1]}'
         # display temporal coherence value of the pixel
-        if self.tcoh_file:
-            tcoh = self.tcoh[yx[0], yx[1]]
+        tcoh = self.get_temporal_coherence(yx)
+        if tcoh is not None:
             plotDict['fig_title'] += f', tcoh = {tcoh:.2f}'
         plotDict['colormap'] = self.colormap
         plotDict['cmap_vlist'] = self.cmap_vlist
@@ -284,7 +290,7 @@ class coherenceMatrixViewer():
         # info
         msg = f'pixel in yx = {tuple(yx)}, '
         msg += f'min/max spatial coherence: {np.min(coh):.2f} / {np.max(coh):.2f}, '
-        if self.tcoh_file:
+        if tcoh is not None:
             msg += f'temporal coherence: {tcoh:.2f}'
         vprint(msg)
 
@@ -317,3 +323,13 @@ class coherenceMatrixViewer():
 
         self.ax_img.plot(yx[1], yx[0], 'r^', markersize=10, markeredgecolor='black')
         self.fig_img.canvas.draw_idle()
+
+    def get_temporal_coherence(self, yx):
+        """Return temporal coherence value for the input pixel, if available."""
+        if self.tcoh is None:
+            return None
+
+        y, x = yx
+        if not (0 <= y < self.tcoh.shape[0] and 0 <= x < self.tcoh.shape[1]):
+            return None
+        return self.tcoh[y, x]
