@@ -74,6 +74,8 @@ class coherenceMatrixViewer():
         self.ax_mat = None
 
         self.time_axis = getattr(inps, 'time_axis', False)
+        self.img_marker = None
+        self.img_marker_size = None
 
         # copy inps to self object
         for key, value in inps.__dict__.items():
@@ -173,6 +175,10 @@ class coherenceMatrixViewer():
         view_inps.print_msg = self.print_msg
         self.ax_img = view.plot_slice(self.ax_img, d_img, atr, view_inps)[0]
         self.fig_coord = view_inps.fig_coord
+        if self.fig_coord == 'geo':
+            self.img_marker_size = view_inps.pts_marker_size
+        else:
+            self.img_marker_size = view_inps.ref_marker_size
 
         self.fig_img.canvas.manager.set_window_title(self.figname_img)
         self.fig_img.tight_layout()
@@ -310,6 +316,9 @@ class coherenceMatrixViewer():
             else:
                 yx = [int(event.ydata+0.5),
                       int(event.xdata+0.5)]
+            if not self.is_valid_yx(yx):
+                vprint(f'ignore point outside ifgramStack coverage: {yx}')
+                return
             self.plot_coherence_matrix4pixel(yx)
             self.update_image_marker(yx)
         elif event.inaxes == self.ax_mat:
@@ -317,11 +326,21 @@ class coherenceMatrixViewer():
 
     def update_image_marker(self, yx):
         """Update the marker point in the image window."""
+        xlim = self.ax_img.get_xlim()
+        ylim = self.ax_img.get_ylim()
         for artist in self.ax_img.get_children():
             if hasattr(artist, 'get_marker') and artist.get_marker() == '^':
                 artist.remove()
 
-        self.ax_img.plot(yx[1], yx[0], 'r^', markersize=10, markeredgecolor='black')
+        if self.fig_coord == 'geo':
+            lat, lon = self.coord.radar2geo(yx[0], yx[1], print_msg=False)[0:2]
+            x, y = lon, lat
+        else:
+            x, y = yx[1], yx[0]
+        self.img_marker = self.ax_img.plot(
+            x, y, 'r^', markersize=self.img_marker_size, markeredgecolor='black')[0]
+        self.ax_img.set_xlim(xlim)
+        self.ax_img.set_ylim(ylim)
         self.fig_img.canvas.draw_idle()
 
     def get_temporal_coherence(self, yx):
@@ -333,3 +352,8 @@ class coherenceMatrixViewer():
         if not (0 <= y < self.tcoh.shape[0] and 0 <= x < self.tcoh.shape[1]):
             return None
         return self.tcoh[y, x]
+
+    def is_valid_yx(self, yx):
+        """Check whether the input pixel is within the ifgramStack coverage."""
+        y, x = yx
+        return 0 <= y < self.ifgram_shape[0] and 0 <= x < self.ifgram_shape[1]
