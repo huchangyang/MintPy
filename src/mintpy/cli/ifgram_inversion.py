@@ -70,7 +70,10 @@ def create_parser(subparsers=None):
     parser.add_argument('-o', '--output', dest='outfile', nargs=3,
                         metavar=('TS_FILE', 'TCOH_FILE', 'NUM_INV_FILE'),
                         help='Output file name. (default: %(default)s).')
-    parser.add_argument('--ref-date', dest='ref_date', help='Reference date, first date by default.')
+    parser.add_argument('--ref-date', dest='refDate', default=None,
+                        help='Reference date for network inversion (default: first date;\n'
+                             'with --allow-partial-network and no value, auto-select the date\n'
+                             'with the largest spatial support). Same as mintpy.networkInversion.refDate.')
     parser.add_argument('--skip-reference','--skip-ref', dest='skip_ref', action='store_true',
                         help='[for offset and testing] do not apply spatial referencing.')
 
@@ -104,10 +107,9 @@ def create_parser(subparsers=None):
                       help='minimum redundancy of interferograms for every SAR acquisition. (default: %(default)s).')
     mask.add_argument('--allow-partial-network', dest='allowPartialNetwork', action='store_true', default=False,
                       help='Allow inversion for pixels where some SAR acquisitions have no valid\n'
-                           'interferograms (isolated dates). Those dates are filled with NaN in\n'
-                           'the output timeseries instead of masking out the entire pixel.\n'
-                           'For SBAS: long-baseline interferograms spanning isolated dates still\n'
-                           'constrain those epochs. (default: %(default)s).')
+                           'interferograms. Only dates connected to the global reference date are\n'
+                           'inverted; other dates are filled with NaN instead of masking the whole\n'
+                           'pixel. (default: %(default)s).')
     # for offset ONLY
     #mask.add_argument('--mask-min-snr', dest='maskMinSNR', type=float, default=10.0,
     #                  help='minimum SNR to disable/ignore the threshold-based masking [for offset only].')
@@ -242,6 +244,12 @@ def read_template2inps(template_file, inps):
                 iDict[key] = value
             else:
                 iDict[key] = str(value).lower() in ['yes', 'true', '1']
+        elif key in ['refDate']:
+            # auto/no -> False/None means leave unset for later auto-selection
+            if value in [None, False] or str(value).lower() in ['auto', 'no', 'none', 'false']:
+                iDict[key] = None
+            else:
+                iDict[key] = str(value)
         elif value:
             if key in ['maskThreshold', 'minRedundancy']:
                 iDict[key] = float(value)

@@ -37,9 +37,18 @@ def run_iono_split_spectrum(inps):
     # 3. estimate iono time-series
     # hardwire "--dset unwrapPhase" to ignore dataset name change from unwrapping error correction options
     # pass the template file so that network-inversion options (e.g. allowPartialNetwork) are respected
+    # reuse displacement REF_DATE when available so ion and displacement share the same reference
     print('\n'+'-'*80)
     print('Estimate ionospheric delay time-series via ifgram_inversion.py ...')
     cmd = f'ifgram_inversion.py {inps.iono_stack_file} --dset unwrapPhase --weight-func no -t {inps.template_file} --update'
+    if inps.dis_file:
+        from mintpy.utils import readfile
+        try:
+            atr_ts = readfile.read_attribute(inps.dis_file)
+            if atr_ts.get('REF_DATE'):
+                cmd += f' --ref-date {atr_ts["REF_DATE"]}'
+        except Exception:
+            pass
     print(cmd)
     ifgram_inversion.main(cmd.split()[1:])
 

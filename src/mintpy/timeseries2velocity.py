@@ -169,7 +169,7 @@ def _estimate_part_date_pixel(model, date_list, dis_ts, seconds=0):
 def _calc_fit_coherence(residual, wavelength):
     """Calculate coherence-like quality from time-function residual displacement."""
     if wavelength is None:
-        return 0.
+        return np.nan
 
     residual_phase = -4. * np.pi * residual / wavelength
     return np.abs(np.sum(np.exp(1j * residual_phase))) / residual_phase.size
@@ -217,7 +217,7 @@ def run_timeseries2time_func(inps):
 
     wavelength = float(atr['WAVELENGTH']) if 'WAVELENGTH' in atr.keys() else None
     if inps.allowPartialDate and wavelength is None:
-        print('WARNING: WAVELENGTH attribute not found; fitCoherence will be set to 0.')
+        print('WARNING: WAVELENGTH attribute not found; fitCoherence will be set to NaN.')
 
     # time_func_param: config parameter
     print(f'add/update the following configuration metadata:\n{config_keys}')
@@ -288,9 +288,9 @@ def run_timeseries2time_func(inps):
             print(f'box width:  {box_wid}')
             print(f'box length: {box_len}')
 
-        # initiate output
-        m = np.zeros((num_param, num_pixel), dtype=DATA_TYPE)
-        m_std = np.zeros((num_param, num_pixel), dtype=DATA_TYPE)
+        # initiate output (NaN = not estimated)
+        m = np.full((num_param, num_pixel), np.nan, dtype=DATA_TYPE)
+        m_std = np.full((num_param, num_pixel), np.nan, dtype=DATA_TYPE)
 
         # read input
         print(f'reading data from file {inps.timeseries_file} ...')
@@ -356,8 +356,22 @@ def run_timeseries2time_func(inps):
         print('number of pixels to invert: {} out of {} ({:.1f}%)'.format(
             num_pixel2inv, num_pixel, num_pixel2inv/num_pixel*100))
 
-        # go to next if no valid pixel found
+        # write NaN for empty boxes and continue
         if num_pixel2inv == 0:
+            block = [box[1], box[3], box[0], box[2]]
+            ds_dict = model2hdf5_dataset(model, m, m_std, mask=mask)[0]
+            if inps.uncertaintyQuantification == 'residue':
+                ds_dict['residue'] = np.full(num_pixel, np.nan, dtype=DATA_TYPE)
+            for ds_name, data in ds_dict.items():
+                writefile.write_hdf5_block(inps.outfile,
+                                           data=data.reshape(box_len, box_wid),
+                                           datasetName=ds_name,
+                                           block=block)
+            if inps.allowPartialDate:
+                writefile.write_hdf5_block(inps.fitCoherenceFile,
+                                           data=np.full((box_len, box_wid), np.nan, dtype=DATA_TYPE),
+                                           datasetName='fitCoherence',
+                                           block=block)
             continue
 
 
@@ -376,8 +390,8 @@ def run_timeseries2time_func(inps):
                 num_pixel2inv_all, num_pixel2inv_all/num_pixel2inv*100))
             print('pixels with valid observations in some dates: {} ({:.1f}%)'.format(
                 num_pixel2inv_part, num_pixel2inv_part/num_pixel2inv*100))
-            e2 = np.zeros(num_pixel, dtype=DATA_TYPE)
-            fit_coh = np.zeros(num_pixel, dtype=DATA_TYPE)
+            e2 = np.full(num_pixel, np.nan, dtype=DATA_TYPE)
+            fit_coh = np.full(num_pixel, np.nan, dtype=DATA_TYPE)
         else:
             ts_data = ts_data[:, mask]
 
@@ -559,7 +573,7 @@ def run_timeseries2time_func(inps):
         ds_dict = model2hdf5_dataset(model, m, m_std, mask=mask)[0]
         # save dataset: residue
         if inps.uncertaintyQuantification == 'residue':
-            ds_dict['residue'] = np.zeros(num_pixel, dtype=DATA_TYPE)
+            ds_dict['residue'] = np.full(num_pixel, np.nan, dtype=DATA_TYPE)
             if inps.allowPartialDate:
                 ds_dict['residue'][mask] = np.sqrt(e2[mask])
             else:
@@ -764,11 +778,13 @@ def model2hdf5_dataset(model, m=None, m_std=None, mask=None, ds_shape=None, resi
             coef_cos = m[p0 + 2*i, :]
             coef_sin = m[p0 + 2*i + 1, :]
             period_amp = np.sqrt(coef_cos**2 + coef_sin**2)
-            period_pha = np.zeros(num_pixel, dtype=DATA_TYPE)
+            period_pha = np.full(num_pixel, np.nan, dtype=DATA_TYPE)
             # avoid divided by zero warning
             if not np.all(coef_sin[mask] == 0):
                 # use atan2, instead of atan, to get phase within [-pi, pi]
                 period_pha[mask] = np.arctan2(coef_cos[mask], coef_sin[mask])
+            else:
+                period_pha[mask] = 0.
 
             # assign ds_dict
             for dsName, data in zip(dsNames, [period_amp, period_pha]):

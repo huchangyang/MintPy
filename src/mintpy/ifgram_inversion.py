@@ -30,6 +30,7 @@ config_keys = [
     'minRedundancy',
     'minNormVelocity',
     'allowPartialNetwork',
+    'refDate',
 ]
 
 
@@ -77,6 +78,9 @@ def run_or_skip(inps):
         if any(str(vars(inps)[key]) != atr_ts.get(key_prefix+key, 'None') for key in config_keys):
             flag = 'run'
             print(f'3) NOT all key configuration parameters are the same: {config_keys}')
+        elif getattr(inps, 'refDate', None) and atr_ts.get('REF_DATE') != str(inps.refDate):
+            flag = 'run'
+            print(f'3) NOT the same REF_DATE: {atr_ts.get("REF_DATE")} vs {inps.refDate}')
         elif meta_keys and any(atr_ts[key] != atr_ifg[key] for key in meta_keys):
             flag = 'run'
             print(f'3) NOT all the metadata are the same: {meta_keys}')
@@ -89,9 +93,187 @@ def run_or_skip(inps):
 
 
 ################################# Time-series Estimator ###################################
+def get_date_edges(date_list, date12_list):
+    """Return date-index edges for each interferogram.
+
+    Parameters: date_list   - list of str, SAR acquisition dates
+                date12_list - list of str, interferogram date12 in YYYYMMDD_YYYYMMDD
+    Returns:    edges       - 2D np.ndarray in size of (num_pair, 2), int16
+    """
+    date2idx = {date: i for i, date in enumerate(date_list)}
+    edges = np.empty((len(date12_list), 2), dtype=np.int16)
+    for i, date12 in enumerate(date12_list):
+        date1, date2 = date12.split('_')
+        edges[i, 0] = date2idx[date1]
+        edges[i, 1] = date2idx[date2]
+    return edges
+
+
+def get_ref_connected_component(num_date, edges, ref_ind, min_redundancy=1.0):
+    """Find dates connected to the global reference after redundancy filtering.
+
+    Parameters: num_date       - int
+                edges          - 2D np.ndarray in size of (num_obs, 2)
+                ref_ind        - int, index of the global reference date
+                min_redundancy - float, min number of ifgrams involving each date
+    Returns:    connected      - 1D np.ndarray of bool in size of (num_date,)
+                keep_edge      - 1D np.ndarray of bool in size of (num_obs,)
+    """
+    num_obs = edges.shape[0]
+    if num_obs == 0:
+        return np.zeros(num_date, dtype=np.bool_), np.zeros(0, dtype=np.bool_)
+
+    keep_edge = np.ones(num_obs, dtype=np.bool_)
+    while True:
+        degree = np.zeros(num_date, dtype=np.float32)
+        used = np.where(keep_edge)[0]
+        if used.size:
+            np.add.at(degree, edges[used, 0], 1)
+            np.add.at(degree, edges[used, 1], 1)
+        valid_date = degree >= min_redundancy
+        new_keep = keep_edge & valid_date[edges[:, 0]] & valid_date[edges[:, 1]]
+        if np.array_equal(new_keep, keep_edge):
+            break
+        keep_edge = new_keep
+
+    connected = np.zeros(num_date, dtype=np.bool_)
+    if not valid_date[ref_ind] or not np.any(keep_edge):
+        return connected, keep_edge
+
+    # BFS / DFS from the reference date on the surviving edges
+    adj = [[] for _ in range(num_date)]
+    for i in np.where(keep_edge)[0]:
+        date1, date2 = int(edges[i, 0]), int(edges[i, 1])
+        adj[date1].append(date2)
+        adj[date2].append(date1)
+
+    stack = [ref_ind]
+    connected[ref_ind] = True
+    while stack:
+        node = stack.pop()
+        for neigh in adj[node]:
+            if not connected[neigh]:
+                connected[neigh] = True
+                stack.append(neigh)
+
+    keep_edge = keep_edge & connected[edges[:, 0]] & connected[edges[:, 1]]
+    return connected, keep_edge
+
+
+def build_partial_design_matrix(edges, tbase, connected, keep_edge, ref_ind,
+                                min_norm_velocity=True):
+    """Build local design matrix on the reference-connected date subset.
+
+    Parameters: edges             - 2D np.ndarray in size of (num_obs_all, 2)
+                tbase             - 1D np.ndarray in size of (num_date,), years
+                connected         - 1D np.ndarray of bool in size of (num_date,)
+                keep_edge         - 1D np.ndarray of bool in size of (num_obs_all,)
+                ref_ind           - int
+                min_norm_velocity - bool
+    Returns:    G                 - 2D np.ndarray local design matrix A or B
+                local_date_inds   - 1D np.ndarray of int, global date indices in G order
+                                    (includes ref_ind for mapping; G itself excludes ref
+                                    for phase, or uses local intervals for velocity)
+                local_tbase_diff  - 2D np.ndarray in size of (num_local_date-1, 1) or None
+                local_ref_ind     - int, reference index in local_date_inds
+                row_inds          - 1D np.ndarray of int, rows in the valid-obs arrays used
+    """
+    local_date_inds = np.where(connected)[0]
+    row_inds = np.where(keep_edge)[0]
+    if local_date_inds.size < 2 or row_inds.size < 1:
+        return None, local_date_inds, None, 0, row_inds
+
+    local_ref_ind = int(np.where(local_date_inds == ref_ind)[0][0])
+    global2local = -np.ones(connected.size, dtype=np.int16)
+    global2local[local_date_inds] = np.arange(local_date_inds.size, dtype=np.int16)
+
+    local_edges = global2local[edges[row_inds]]
+    local_tbase = tbase[local_date_inds]
+    num_obs = row_inds.size
+    num_local = local_date_inds.size
+
+    if min_norm_velocity:
+        G = np.zeros((num_obs, num_local), dtype=np.float32)
+        for i in range(num_obs):
+            ind1, ind2 = int(local_edges[i, 0]), int(local_edges[i, 1])
+            if ind1 < ind2:
+                G[i, ind1:ind2] = local_tbase[ind1 + 1:ind2 + 1] - local_tbase[ind1:ind2]
+            else:
+                G[i, ind2:ind1] = local_tbase[ind2:ind1] - local_tbase[ind2 + 1:ind1 + 1]
+        G = G[:, :-1]
+        local_tbase_diff = np.diff(local_tbase).reshape(-1, 1)
+    else:
+        G = np.zeros((num_obs, num_local), dtype=np.float32)
+        for i in range(num_obs):
+            ind1, ind2 = int(local_edges[i, 0]), int(local_edges[i, 1])
+            G[i, ind1] = -1.
+            G[i, ind2] = 1.
+        G = np.hstack((G[:, :local_ref_ind], G[:, local_ref_ind + 1:]))
+        local_tbase_diff = None
+
+    return G, local_date_inds, local_tbase_diff, local_ref_ind, row_inds
+
+
+def select_best_ref_date(stack_obj, obs_ds_name='unwrapPhase', mask_ds_name=None,
+                         mask_threshold=0.4, water_mask_file=None, max_memory=4.0):
+    """Select the SAR date with the largest spatial support for partial-network inversion.
+
+    Support of a date is the number of land pixels where at least one valid observation
+    involves that date. Ties keep the earliest date.
+    """
+    date_list = stack_obj.get_date_list(dropIfgram=True)
+    date12_list = stack_obj.get_date12_list(dropIfgram=True)
+    edges = get_date_edges(date_list, date12_list)
+    num_date = len(date_list)
+    num_pair = len(date12_list)
+    support = np.zeros(num_date, dtype=np.int64)
+
+    box_list = stack_obj.split2boxes(max_memory=max_memory)[0]
+    for box in box_list:
+        stack_obs = stack_obj.read(datasetName=obs_ds_name,
+                                   box=box,
+                                   dropIfgram=True,
+                                   print_msg=False).reshape(num_pair, -1)
+        if 'phase' in obs_ds_name.lower():
+            stack_obs = stack_obs.astype(np.float32, copy=False)
+            stack_obs[stack_obs == 0.] = np.nan
+        stack_obs = mask_stack_obs(stack_obs, stack_obj, box,
+                                   mask_ds_name=mask_ds_name,
+                                   mask_threshold=mask_threshold,
+                                   dropIfgram=True, print_msg=False)[0]
+
+        mask = ~np.all(np.isnan(stack_obs), axis=0)
+        if water_mask_file and os.path.isfile(water_mask_file):
+            ds_names = readfile.get_dataset_list(water_mask_file)
+            ds_name = [i for i in ds_names if i in ['waterMask', 'mask']][0]
+            water_mask = readfile.read(water_mask_file, datasetName=ds_name, box=box)[0].flatten()
+            mask *= water_mask != 0
+
+        if not np.any(mask):
+            continue
+
+        valid = ~np.isnan(stack_obs[:, mask])
+        date_hit = np.zeros((num_date, int(np.sum(mask))), dtype=np.bool_)
+        for i in range(edges.shape[0]):
+            obs_flag = valid[i]
+            if not np.any(obs_flag):
+                continue
+            date_hit[edges[i, 0], obs_flag] = True
+            date_hit[edges[i, 1], obs_flag] = True
+        support += date_hit.sum(axis=1)
+
+    best_ind = int(np.argmax(support))
+    print('select reference date with the largest spatial support for partial network:')
+    for i, date in enumerate(date_list):
+        flag = ' <--' if i == best_ind else ''
+        print(f'  {date}: {support[i]} pixels{flag}')
+    return date_list[best_ind]
+
+
 def estimate_timeseries(A, B, y, tbase_diff, weight_sqrt=None, min_norm_velocity=True,
                         rcond=1e-5, min_redundancy=1., inv_quality_name='temporalCoherence',
-                        allow_partial_network=False, print_msg=True):
+                        allow_partial_network=False, date_list=None, date12_list=None,
+                        ref_date=None, tbase=None, print_msg=True):
     """Estimate time-series from a stack/network of interferograms with
     Least Square minimization on deformation phase / velocity.
 
@@ -136,214 +318,189 @@ def estimate_timeseries(A, B, y, tbase_diff, weight_sqrt=None, min_norm_velocity
                                         temporalCoherence for phase
                                         residual          for offset
                                         no to turn OFF the calculation
-                allow_partial_network - bool, if True, invert pixels with isolated dates (no valid
-                                        interferograms for some SAR acquisitions) and mark isolated
-                                        dates as NaN rather than skipping the entire pixel.
-                                        For SBAS: uses B-column connectivity; interferograms spanning
-                                        over isolated dates can still constrain those epochs.
-                                        For min-norm displacement: isolated dates are removed from A.
+                allow_partial_network - bool, if True, invert only the date subset connected to the
+                                        global reference date; other dates are filled with NaN.
+                date_list             - list of str, required when allow_partial_network=True
+                date12_list           - list of str, required when allow_partial_network=True
+                ref_date              - str, global reference date for partial-network inversion
+                tbase                 - 1D np.ndarray in size of (num_date,), absolute temporal
+                                        baseline in years, required when allow_partial_network=True
     Returns:    ts                - 2D np.ndarray in size of (num_date, num_pixel), phase time-series
                 inv_quality       - 1D np.ndarray in size of (num_pixel) or float, temporal coherence (for phase) or residual (for offset)
                 num_inv_obs       - 1D np.ndarray in size of (num_pixel) or int, number of observations (ifgrams / offsets)
                                     used during the inversion
     """
 
-    y = y.reshape(A.shape[0], -1)
+    y = np.asarray(y, dtype=np.float32)
+    if y.ndim == 1:
+        y = y.reshape(-1, 1)
     if weight_sqrt is not None:
-        weight_sqrt = weight_sqrt.reshape(A.shape[0], -1)
-    num_date = A.shape[1] + 1
+        weight_sqrt = np.asarray(weight_sqrt, dtype=np.float32)
+        if weight_sqrt.ndim == 1:
+            weight_sqrt = weight_sqrt.reshape(-1, 1)
+
+    if allow_partial_network:
+        if date_list is None or date12_list is None or tbase is None:
+            raise ValueError('date_list, date12_list and tbase are required for allow_partial_network!')
+        num_date = len(date_list)
+        if y.shape[0] != len(date12_list):
+            raise ValueError(f'y rows ({y.shape[0]}) != date12_list size ({len(date12_list)})')
+    else:
+        y = y.reshape(A.shape[0], -1)
+        if weight_sqrt is not None:
+            weight_sqrt = weight_sqrt.reshape(A.shape[0], -1)
+        num_date = A.shape[1] + 1
     num_pixel = y.shape[1]
 
     # initial output value
     ts = np.zeros((num_date, num_pixel), dtype=np.float32)
     if inv_quality_name == 'residual':
-        inv_quality = np.nan
+        inv_quality = np.full(num_pixel, np.nan, dtype=np.float32)
     else:
-        inv_quality = 0.
-    num_inv_obs = 0
+        inv_quality = np.zeros(num_pixel, dtype=np.float32)
+    num_inv_obs = np.zeros(num_pixel, dtype=np.int16)
+
+    ##### partial network: invert only the reference-connected date subset
+    if allow_partial_network:
+        ref_date = ref_date or date_list[0]
+        if ref_date not in date_list:
+            raise ValueError(f'reference date {ref_date} is not in date_list!')
+        ref_ind = date_list.index(ref_date)
+        edges_all = get_date_edges(date_list, date12_list)
+        tbase = np.asarray(tbase, dtype=np.float32).reshape(-1)
+        if tbase.size != num_date:
+            raise ValueError(f'tbase size ({tbase.size}) != num_date ({num_date})')
+
+        # pixel-by-pixel because each pixel may keep a different observation subset
+        for i in range(num_pixel):
+            yi = y[:, i:i+1]
+            wi = weight_sqrt[:, i:i+1] if weight_sqrt is not None else None
+            valid = (~np.isnan(yi[:, 0])).flatten()
+            if not np.any(valid):
+                ts[:, i] = np.nan
+                continue
+
+            edges = edges_all[valid]
+            y_valid = yi[valid, :]
+            w_valid = wi[valid, :] if wi is not None else None
+            connected, keep_edge = get_ref_connected_component(
+                num_date, edges, ref_ind, min_redundancy=min_redundancy)
+
+            if not connected[ref_ind] or not np.any(keep_edge):
+                ts[:, i] = np.nan
+                continue
+
+            G, local_date_inds, local_tbase_diff, local_ref_ind, row_inds = build_partial_design_matrix(
+                edges, tbase, connected, keep_edge, ref_ind,
+                min_norm_velocity=min_norm_velocity)
+            if G is None or G.shape[0] < 1 or G.shape[1] < 1:
+                ts[:, i] = np.nan
+                continue
+
+            y_inv = y_valid[row_inds, :]
+            w_inv = w_valid[row_inds, :] if w_valid is not None else None
+            try:
+                if w_inv is not None:
+                    X, e2 = linalg.lstsq(np.multiply(G, w_inv),
+                                         np.multiply(y_inv, w_inv),
+                                         cond=rcond)[:2]
+                else:
+                    X, e2 = linalg.lstsq(G, y_inv, cond=rcond)[:2]
+
+                if inv_quality_name != 'no':
+                    inv_quality[i] = calc_inv_quality(
+                        G, X, y_inv, e2,
+                        inv_quality_name=inv_quality_name,
+                        weight_sqrt=w_inv,
+                        print_msg=False)[0]
+
+                ts[:, i] = np.nan
+                if min_norm_velocity:
+                    ts_local = np.zeros(local_date_inds.size, dtype=np.float32)
+                    ts_local[1:] = np.cumsum((X * local_tbase_diff).flatten(), axis=0)
+                    ts_local -= ts_local[local_ref_ind]
+                    ts[local_date_inds, i] = ts_local
+                else:
+                    ts[ref_ind, i] = 0.
+                    non_ref_local = np.r_[local_date_inds[:local_ref_ind],
+                                          local_date_inds[local_ref_ind + 1:]]
+                    ts[non_ref_local, i] = X.flatten()
+
+                num_inv_obs[i] = y_inv.shape[0]
+            except linalg.LinAlgError:
+                ts[:, i] = np.nan
+
+        if num_pixel == 1:
+            return ts, float(np.atleast_1d(inv_quality)[0]), int(num_inv_obs[0])
+        return ts, inv_quality, num_inv_obs
 
     ##### skip invalid phase/offset value [NaN]
     y, [A, B, weight_sqrt] = skip_invalid_obs(y, mat_list=[A, B, weight_sqrt])
 
-    # check 1 - network redundancy
-    a_col_sum = np.sum(A != 0., axis=0)
-
-    if allow_partial_network:
-        # identify isolated A columns (dates with no valid single-epoch connections)
-        isolated_A_flags = a_col_sum < min_redundancy
-
-        if min_norm_velocity:
-            # For SBAS: check B-column connectivity instead of A-column.
-            # Long-baseline interferograms spanning an isolated date still contribute
-            # non-zero entries in B, so those dates CAN be estimated via cumsum.
-            # Identify intervals where no interferogram provides any constraint at all.
-            b_col_sum = np.sum(np.abs(B), axis=0).ravel()
-            null_interval_flags = b_col_sum == 0
-
-            # A date k (k >= 1) cannot be estimated if any interval j < k has no valid
-            # observations (B column j == 0), since ts[k] = cumsum(v * dt) from date 0.
-            null_date_mask = np.zeros(num_date, dtype=np.bool_)
-            cumulative_null = False
-            for j in range(num_date - 1):
-                if null_interval_flags[j]:
-                    cumulative_null = True
-                if cumulative_null:
-                    null_date_mask[j + 1] = True
-            null_date_inds = np.where(null_date_mask)[0]
-
-            # find valid intervals prefix (before the first null interval)
-            if np.any(null_interval_flags):
-                first_null_interval = int(np.where(null_interval_flags)[0][0])
-            else:
-                first_null_interval = num_date - 1  # all intervals valid
-
-            # skip pixel if no valid interval at all
-            if first_null_interval == 0:
-                ts[null_date_inds, :] = np.nan
-                return ts, inv_quality, num_inv_obs
-
-            # reduce B and tbase_diff to the valid prefix of intervals
-            B_inv = B[:, :first_null_interval]
-            tbase_diff_inv = tbase_diff[:first_null_interval]
-
-            # remove rows where all valid-prefix B entries are zero (uninformative rows)
-            row_valid = np.any(B_inv != 0., axis=1)
-            if not np.any(row_valid):
-                ts[null_date_inds, :] = np.nan
-                return ts, inv_quality, num_inv_obs
-            B_inv = B_inv[row_valid, :]
-            y_inv = y[row_valid, :]
-            weight_sqrt_inv = weight_sqrt[row_valid, :] if weight_sqrt is not None else None
-
+    # original behavior: skip entire pixel if any date is under-connected
+    if np.min(np.sum(A != 0., axis=0)) < min_redundancy:
+        if inv_quality_name == 'residual':
+            inv_quality = np.nan
         else:
-            # For min-norm displacement: remove isolated A columns.
-            valid_A_col_flags = ~isolated_A_flags
-            if not np.any(valid_A_col_flags):
-                return ts, inv_quality, num_inv_obs
-            valid_A_col_inds = np.where(valid_A_col_flags)[0]
-            A_inv = A[:, valid_A_col_inds]
-            y_inv = y
-            weight_sqrt_inv = weight_sqrt
-            null_date_inds = np.where(isolated_A_flags)[0] + 1
-
-    else:
-        # original behavior: skip entire pixel if any date is under-connected
-        if np.min(a_col_sum) < min_redundancy:
-            return ts, inv_quality, num_inv_obs
-
-    # check 2 - matrix invertability (for WLS only because OLS contains it already)
-    # Yunjun, Mar 2022: from my vague memory, a singular design matrix B returns error from scipy.linalg,
-    #     but somehow gives results after weighting, so I decided to not trust that result via this check
-    # Sara, Mar 2022: comment this check after correcting design matrix B for non-sequential networks
-    #     a.k.a., networks with the first date not being the earlier date
-    #if weight_sqrt is not None:
-    #    try:
-    #        linalg.inv(np.dot(B.T, B))
-    #    except linalg.LinAlgError:
-    #        return ts, inv_quality, num_inv_obs
+            inv_quality = 0.
+        return ts, inv_quality, 0
 
     ##### invert time-series
     try:
         if min_norm_velocity:
-            ##### min-norm velocity
-            if allow_partial_network and np.any(null_date_mask):
-                # partial network: invert reduced B (valid interval prefix only)
-                if weight_sqrt_inv is not None:
-                    X, e2 = linalg.lstsq(np.multiply(B_inv, weight_sqrt_inv),
-                                         np.multiply(y_inv, weight_sqrt_inv),
-                                         cond=rcond)[:2]
-                else:
-                    X, e2 = linalg.lstsq(B_inv, y_inv, cond=rcond)[:2]
-
-                # calc inversion quality using the reduced system
-                if inv_quality_name != 'no':
-                    inv_quality = calc_inv_quality(B_inv, X, y_inv, e2,
-                                                   inv_quality_name=inv_quality_name,
-                                                   weight_sqrt=weight_sqrt_inv,
-                                                   print_msg=print_msg)
-
-                # assemble time-series for the valid prefix
-                ts_diff = X * np.tile(tbase_diff_inv, (1, num_pixel))
-                ts[1:first_null_interval + 1, :] = np.cumsum(ts_diff, axis=0)
-                # mark dates beyond the first broken interval as NaN
-                ts[null_date_inds, :] = np.nan
-
+            if weight_sqrt is not None:
+                X, e2 = linalg.lstsq(np.multiply(B, weight_sqrt),
+                                     np.multiply(y, weight_sqrt),
+                                     cond=rcond)[:2]
             else:
-                # standard path (all intervals valid)
-                if weight_sqrt is not None:
-                    X, e2 = linalg.lstsq(np.multiply(B, weight_sqrt),
-                                         np.multiply(y, weight_sqrt),
-                                         cond=rcond)[:2]
-                else:
-                    X, e2 = linalg.lstsq(B, y, cond=rcond)[:2]
+                X, e2 = linalg.lstsq(B, y, cond=rcond)[:2]
 
-                # calc inversion quality
-                if inv_quality_name != 'no':
-                    inv_quality = calc_inv_quality(B, X, y, e2,
-                                                   inv_quality_name=inv_quality_name,
-                                                   weight_sqrt=weight_sqrt,
-                                                   print_msg=print_msg)
+            if inv_quality_name != 'no':
+                inv_quality = calc_inv_quality(B, X, y, e2,
+                                               inv_quality_name=inv_quality_name,
+                                               weight_sqrt=weight_sqrt,
+                                               print_msg=print_msg)
 
-                # assemble time-series
-                ts_diff = X * np.tile(tbase_diff, (1, num_pixel))
-                ts[1:, :] = np.cumsum(ts_diff, axis=0)
+            ts_diff = X * np.tile(tbase_diff, (1, num_pixel))
+            ts[1:, :] = np.cumsum(ts_diff, axis=0)
 
         else:
-            ##### min-norm displacement
-            if allow_partial_network and np.any(isolated_A_flags):
-                # partial network: invert reduced A (isolated dates removed)
-                if weight_sqrt_inv is not None:
-                    X, e2 = linalg.lstsq(np.multiply(A_inv, weight_sqrt_inv),
-                                         np.multiply(y_inv, weight_sqrt_inv),
-                                         cond=rcond)[:2]
-                else:
-                    X, e2 = linalg.lstsq(A_inv, y_inv, cond=rcond)[:2]
-
-                # calc inversion quality using reduced system
-                if inv_quality_name != 'no':
-                    inv_quality = calc_inv_quality(A_inv, X, y_inv, e2,
-                                                   inv_quality_name=inv_quality_name,
-                                                   weight_sqrt=weight_sqrt_inv,
-                                                   print_msg=print_msg)
-
-                # assemble time-series: map valid dates back; isolated dates stay NaN
-                valid_date_inds = valid_A_col_inds + 1  # +1 because col j -> date j+1
-                ts[valid_date_inds, :] = X
-                ts[null_date_inds, :] = np.nan
-
+            if weight_sqrt is not None:
+                X, e2 = linalg.lstsq(np.multiply(A, weight_sqrt),
+                                     np.multiply(y, weight_sqrt),
+                                     cond=rcond)[:2]
             else:
-                # standard path
-                if weight_sqrt is not None:
-                    X, e2 = linalg.lstsq(np.multiply(A, weight_sqrt),
-                                         np.multiply(y, weight_sqrt),
-                                         cond=rcond)[:2]
-                else:
-                    X, e2 = linalg.lstsq(A, y, cond=rcond)[:2]
+                X, e2 = linalg.lstsq(A, y, cond=rcond)[:2]
 
-                # calc inversion quality
-                if inv_quality_name != 'no':
-                    inv_quality = calc_inv_quality(A, X, y, e2,
-                                                   inv_quality_name=inv_quality_name,
-                                                   weight_sqrt=weight_sqrt,
-                                                   print_msg=print_msg)
+            if inv_quality_name != 'no':
+                inv_quality = calc_inv_quality(A, X, y, e2,
+                                               inv_quality_name=inv_quality_name,
+                                               weight_sqrt=weight_sqrt,
+                                               print_msg=print_msg)
 
-                # assemble time-series
-                ts[1: ,:] = X
+            ts[1:, :] = X
 
     except linalg.LinAlgError:
         pass
 
-    # number of observations used for inversion
     num_inv_obs = A.shape[0]
 
-    # ensure inv_quality is scalar when num_pixel is 1
     if num_pixel == 1:
         inv_quality = np.atleast_1d(inv_quality)[0]
+        return ts, inv_quality, int(num_inv_obs)
+
+    # broadcast scalar quality / obs count to 1D for multi-pixel standard path
+    if np.ndim(inv_quality) == 0:
+        inv_quality = np.full(num_pixel, inv_quality, dtype=np.float32)
+    if np.ndim(num_inv_obs) == 0:
+        num_inv_obs = np.full(num_pixel, num_inv_obs, dtype=np.int16)
 
     return ts, inv_quality, num_inv_obs
 
 
-def estimate_timeseries_cov(G, y, y_std, rcond=1e-5, min_redundancy=1.0):
+def estimate_timeseries_cov(G, y, y_std, rcond=1e-5, min_redundancy=1.0,
+                            allow_partial_network=False, date_list=None,
+                            date12_list=None, ref_date=None, tbase=None):
     """Estimate the time-series covariance from network of STD via linear propagation.
     Pixel by pixel only.
 
@@ -353,27 +510,73 @@ def estimate_timeseries_cov(G, y, y_std, rcond=1e-5, min_redundancy=1.0):
                 y      - 2D np.ndarray in size of (num_pair, 1), stack of obs
                 y_std  - 2D np.ndarray in size of (num_pair, 1), stack of obs std. dev.
     Returns:    ts_cov - 2D np.ndarray in size of (num_date-1, num_date-1), time-series obs std. dev.
+                         For partial network, disconnected non-reference dates are NaN.
     """
+    y = np.asarray(y, dtype=np.float32)
+    y_std = np.asarray(y_std, dtype=np.float32)
+    if y.ndim == 1:
+        y = y.reshape(-1, 1)
+    if y_std.ndim == 1:
+        y_std = y_std.reshape(-1, 1)
+
+    if allow_partial_network:
+        if date_list is None or date12_list is None or tbase is None:
+            raise ValueError('date_list, date12_list and tbase are required for allow_partial_network!')
+        ref_date = ref_date or date_list[0]
+        ref_ind = date_list.index(ref_date)
+        edges_all = get_date_edges(date_list, date12_list)
+        tbase = np.asarray(tbase, dtype=np.float32).reshape(-1)
+        num_date = len(date_list)
+        num_param = num_date - 1
+        ts_cov = np.full((num_param, num_param), np.nan, dtype=np.float32)
+
+        valid = (~np.isnan(y[:, 0])).flatten()
+        if not np.any(valid):
+            return ts_cov
+
+        edges = edges_all[valid]
+        y_valid = y[valid, :]
+        y_std_valid = y_std[valid, :]
+        connected, keep_edge = get_ref_connected_component(
+            num_date, edges, ref_ind, min_redundancy=min_redundancy)
+        if not connected[ref_ind] or not np.any(keep_edge):
+            return ts_cov
+
+        # covariance is always propagated in the phase / A parameterization
+        G_local, local_date_inds, _, local_ref_ind, row_inds = build_partial_design_matrix(
+            edges, tbase, connected, keep_edge, ref_ind, min_norm_velocity=False)
+        if G_local is None or G_local.shape[0] < 1 or G_local.shape[1] < 1:
+            return ts_cov
+
+        y_inv = y_valid[row_inds, :]
+        y_std_inv = y_std_valid[row_inds, :]
+        Gplus = linalg.pinv(G_local)
+        stack_cov = np.diag(np.square(y_std_inv.flatten()))
+        local_cov = np.linalg.multi_dot([Gplus, stack_cov, Gplus.T]).astype(np.float32)
+
+        # map local non-reference dates back into the global (num_date-1) layout
+        # whose columns follow date_list with ref_date removed
+        global_non_ref = [i for i in range(num_date) if i != ref_ind]
+        local_non_ref = np.r_[local_date_inds[:local_ref_ind],
+                              local_date_inds[local_ref_ind + 1:]]
+        global_inds = [global_non_ref.index(int(i)) for i in local_non_ref]
+        for a, ga in enumerate(global_inds):
+            for b, gb in enumerate(global_inds):
+                ts_cov[ga, gb] = local_cov[a, b]
+        return ts_cov
+
+    num_param = G.shape[1]
+    ts_cov = np.zeros((num_param, num_param), dtype=np.float32)
     y = y.reshape(G.shape[0], -1)
     y_std = y_std.reshape(G.shape[0], -1)
-
-    # initial output value
-    ts_cov = np.zeros((G.shape[1], G.shape[1]), dtype=np.float32)
 
     # skip invalid phase/offset value [NaN]
     y, [G, y_std] = skip_invalid_obs(y, mat_list=[G, y_std])
 
     # check network redundancy: skip calculation if < threshold
-    if np.min(np.sum(G != 0., axis=0)) < min_redundancy:
+    if G.shape[0] == 0 or np.min(np.sum(G != 0., axis=0)) < min_redundancy:
         return ts_cov
 
-    ## std. dev. --> covariance matrix
-    #stack_cov_inv = np.diag(1.0 / np.square(y_std).flatten())
-    ## linear propagation: network covar. mat. --> TS covar. mat. --> TS var.
-    #ts_var = np.diag(linalg.inv(G.T.dot(stack_cov_inv).dot(G))).astype(np.float32)
-    #ts_var[ts_var < rcond] = rcond
-    ## TS var. --> TS std. dev.
-    #ts_cov = np.sqrt(ts_var)
     Gplus = linalg.pinv(G)
     stack_cov = np.diag(np.square(y_std.flatten()))
     ts_cov = np.linalg.multi_dot([Gplus, stack_cov, Gplus.T])
@@ -712,7 +915,7 @@ def get_design_matrix4std(stack_obj):
 def run_ifgram_inversion_patch(ifgram_file, box=None, ref_phase=None, obs_ds_name='unwrapPhase',
                                weight_func='var', water_mask_file=None, min_norm_velocity=True,
                                mask_ds_name=None, mask_threshold=0.4, min_redundancy=1.0,
-                               allow_partial_network=False, calc_cov=False):
+                               allow_partial_network=False, ref_date=None, calc_cov=False):
     """Invert one patch of an ifgram stack into timeseries.
 
     Parameters: ifgram_file           - str, interferograms stack HDF5 file, e.g. ./inputs/ifgramStack.h5
@@ -726,8 +929,9 @@ def run_ifgram_inversion_patch(ifgram_file, box=None, ref_phase=None, obs_ds_nam
                 mask_ds_name          - str, dataset name in ifgram_file used to mask unwrapPhase pixelwisely
                 mask_threshold        - float, min coherence of pixels if mask_dataset_name='coherence'
                 min_redundancy        - float, the min number of ifgrams for every acquisition.
-                allow_partial_network - bool, allow inversion for pixels with isolated dates; mark
-                                        those dates as NaN instead of skipping the whole pixel.
+                allow_partial_network - bool, invert only dates connected to ref_date; mark other
+                                        dates as NaN instead of skipping the whole pixel.
+                ref_date              - str, global reference date used by partial-network inversion
                 calc_cov              - bool, calculate the time series covariance matrix.
     Returns:    ts                - 3D array in size of (num_date, num_row, num_col)
                 ts_cov            - 4D array in size of (num_date, num_date, num_row, num_col) or None
@@ -765,7 +969,11 @@ def run_ifgram_inversion_patch(ifgram_file, box=None, ref_phase=None, obs_ds_nam
 
     # design matrix
     date12_list = stack_obj.get_date12_list(dropIfgram=True)
-    A, B = stack_obj.get_design_matrix4timeseries(date12_list=date12_list)[0:2]
+    ref_date = ref_date or date_list[0]
+    if allow_partial_network:
+        A, B = stack_obj.get_design_matrix4timeseries(date12_list=date12_list, refDate=ref_date)[0:2]
+    else:
+        A, B = stack_obj.get_design_matrix4timeseries(date12_list=date12_list)[0:2]
 
     # 1.1 read / calculate weight and stack STD
     weight_sqrt = None
@@ -781,7 +989,11 @@ def run_ifgram_inversion_patch(ifgram_file, box=None, ref_phase=None, obs_ds_nam
 
         # calculate stack STD
         if calc_cov:
-            A_std, r0 = get_design_matrix4std(stack_obj)[:2]
+            if allow_partial_network:
+                A_std = stack_obj.get_design_matrix4timeseries(date12_list, refDate=ref_date)[0]
+                r0 = date_list.index(ref_date)
+            else:
+                A_std, r0 = get_design_matrix4std(stack_obj)[:2]
             r1 = r0 + 1
             if weight_func == 'var':
                 stack_std = 1. / weight_sqrt
@@ -808,7 +1020,11 @@ def run_ifgram_inversion_patch(ifgram_file, box=None, ref_phase=None, obs_ds_nam
 
             # prepare for Std time-series
             if calc_cov:
-                A_std, r0 = get_design_matrix4std(stack_obj)[:2]
+                if allow_partial_network:
+                    A_std = stack_obj.get_design_matrix4timeseries(date12_list, refDate=ref_date)[0]
+                    r0 = date_list.index(ref_date)
+                else:
+                    A_std, r0 = get_design_matrix4std(stack_obj)[:2]
                 r1 = r0 + 1
                 stack_std = 1. / weight_sqrt
 
@@ -918,6 +1134,10 @@ def run_ifgram_inversion_patch(ifgram_file, box=None, ref_phase=None, obs_ds_nam
         'min_redundancy'        : min_redundancy,
         'inv_quality_name'      : inv_quality_name,
         'allow_partial_network' : allow_partial_network,
+        'date_list'             : date_list,
+        'date12_list'           : date12_list,
+        'ref_date'              : ref_date,
+        'tbase'                 : tbase,
     }
 
     # 2.2 un-weighted inversion (classic SBAS)
@@ -999,10 +1219,17 @@ def run_ifgram_inversion_patch(ifgram_file, box=None, ref_phase=None, obs_ds_nam
         prog_bar = ptime.progressBar(maxValue=num_pixel2inv)
         for i in range(num_pixel2inv):
             idx = idx_pixel2inv[i]
-            ts_covi = estimate_timeseries_cov(A_std,
-                                              y=stack_obs[:, idx],
-                                              y_std=stack_std[:, idx],
-                                              min_redundancy=min_redundancy)
+            ts_covi = estimate_timeseries_cov(
+                A_std,
+                y=stack_obs[:, idx],
+                y_std=stack_std[:, idx],
+                min_redundancy=min_redundancy,
+                allow_partial_network=allow_partial_network,
+                date_list=date_list,
+                date12_list=date12_list,
+                ref_date=ref_date,
+                tbase=tbase,
+            )
 
             # save result to output matrix
             # fill the (N-1xN-1) matrix into the (NxN) matrix
@@ -1092,13 +1319,36 @@ def run_ifgram_inversion(inps):
                                                   skip_reference=inps.skip_ref,
                                                   dropIfgram=True)
 
-    # 1.2 design matrix
-    A = stack_obj.get_design_matrix4timeseries(date12_list)[0]
+    # 1.2 design matrix / reference date
+    if not inps.allowPartialNetwork:
+        if getattr(inps, 'refDate', None) and inps.refDate != date_list[0]:
+            print(f'WARNING: mintpy.networkInversion.refDate={inps.refDate} is used only when '
+                  f'allowPartialNetwork=yes; fall back to the first date {date_list[0]}')
+        inps.refDate = date_list[0]
+    elif not getattr(inps, 'refDate', None):
+        inps.refDate = select_best_ref_date(
+            stack_obj,
+            obs_ds_name=inps.obsDatasetName,
+            mask_ds_name=inps.maskDataset,
+            mask_threshold=inps.maskThreshold,
+            water_mask_file=inps.waterMaskFile,
+            max_memory=inps.maxMemory,
+        )
+    elif inps.refDate not in date_list:
+        raise ValueError(f'input reference date {inps.refDate} is not in {date_list}')
+
+    if inps.allowPartialNetwork:
+        A = stack_obj.get_design_matrix4timeseries(date12_list, refDate=inps.refDate)[0]
+    else:
+        A = stack_obj.get_design_matrix4timeseries(date12_list)[0]
     num_pair, num_date = A.shape[0], A.shape[1]+1
     inps.numIfgram = num_pair
 
     if inps.calcCov:
-        ref_date4std = get_design_matrix4std(stack_obj)[2]
+        if inps.allowPartialNetwork:
+            ref_date4std = inps.refDate
+        else:
+            ref_date4std = get_design_matrix4std(stack_obj)[2]
         ref_msg = f' with REF_DATE = {ref_date4std}'
     else:
         ref_msg = ''
@@ -1114,6 +1364,7 @@ def run_ifgram_inversion(inps):
     msg += f'weight function: {inps.weightFunc}\n'
     msg += f'calculate covariance: {inps.calcCov} {ref_msg}\n'
     msg += f'allow partial network: {inps.allowPartialNetwork}\n'
+    msg += f'reference date: {inps.refDate}\n'
 
     if inps.maskDataset:
         if inps.maskDataset in ['connectComponent']:
@@ -1149,7 +1400,7 @@ def run_ifgram_inversion(inps):
 
     meta['FILE_TYPE'] = 'timeseries'
     meta['UNIT'] = 'm'
-    meta['REF_DATE'] = date_list[0]
+    meta['REF_DATE'] = inps.refDate
 
     # 2.2 instantiate time-series
     dates = np.array(date_list, dtype=np.bytes_)
@@ -1210,6 +1461,7 @@ def run_ifgram_inversion(inps):
         "mask_threshold"        : inps.maskThreshold,
         "min_redundancy"        : inps.minRedundancy,
         "allow_partial_network" : inps.allowPartialNetwork,
+        "ref_date"              : inps.refDate,
         "calc_cov"              : inps.calcCov,
     }
 
