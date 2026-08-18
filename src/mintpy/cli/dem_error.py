@@ -68,6 +68,10 @@ def create_parser(subparsers=None):
 
     parser.add_argument('--phase-velocity', dest='phaseVelocity', action='store_true',
                         help='Use phase velocity instead of phase for inversion constrain.')
+    parser.add_argument('--allow-partial-date', dest='allowPartialDate', action='store_true', default=False,
+                        help='Allow DEM error estimation for pixels with partial-date NaN observations. '
+                             'Only valid dates are used for each pixel; pixels with insufficient '
+                             'observations or rank are skipped. (default: %(default)s).')
     parser.add_argument('--update', dest='update_mode', action='store_true',
                         help='Enable update mode, and skip inversion if:\n'+
                              '1) output time-series file already exists, readable '+
@@ -140,6 +144,11 @@ def read_template2inps(template_file, inps):
         value = template[key_prefix+key]
         if key in ['phaseVelocity']:
             iDict[key] = value
+        elif key in ['allowPartialDate']:
+            if isinstance(value, bool):
+                iDict[key] = value
+            else:
+                iDict[key] = str(value).lower() in ['yes', 'true', '1']
         elif value:
             if key in ['polyOrder']:
                 iDict[key] = int(value)

@@ -14,6 +14,10 @@ import numpy as np
 from scipy import linalg
 
 from mintpy.objects import HDFEOS, cluster, giantTimeseries, timeseries
+from mintpy.objects.velocity_spatial import (
+    accumulate_linear_normal_eq,
+    solve_constrained_velocity,
+)
 from mintpy.utils import ptime, readfile, time_func, writefile
 
 DATA_TYPE = np.float32
@@ -24,6 +28,10 @@ config_keys = [
     'startDate',
     'endDate',
     'excludeDate',
+    'allowPartialDate',
+    'fitCoherenceFile',
+    'spatialSmooth',
+    'spatialSmoothStrength',
     # time functions
     'polynomial',
     'periodic',
@@ -127,6 +135,276 @@ def read_date_info(inps):
     return inps
 
 
+def _get_part_date_lstsq_inputs(model, date_list, dis_ts, seconds=0):
+    """Prepare per-pixel inputs for least squares with partial-date observations."""
+    valid_flag = np.isfinite(dis_ts)
+    valid_date_list = np.array(date_list)[valid_flag].tolist()
+    num_param = time_func.get_num_param(model)
+
+    # Residue-based STD needs at least one degree of freedom.
+    if len(valid_date_list) <= num_param:
+        return None, None, None
+
+    G = time_func.get_design_matrix4time_func(valid_date_list, model=model, seconds=seconds)
+    if np.linalg.matrix_rank(G) < num_param:
+        return None, None, None
+
+    return valid_flag, valid_date_list, G
+
+
+def _estimate_part_date_pixel(model, date_list, dis_ts, seconds=0):
+    """Estimate one pixel using only its finite time-series observations."""
+    valid_flag, valid_date_list, G = _get_part_date_lstsq_inputs(
+        model=model,
+        date_list=date_list,
+        dis_ts=dis_ts,
+        seconds=seconds,
+    )
+    if valid_flag is None:
+        return None, None, None, None
+
+    G, m, e2 = time_func.estimate_time_func(
+        model=model,
+        date_list=valid_date_list,
+        dis_ts=dis_ts[valid_flag].reshape(-1, 1),
+        seconds=seconds,
+    )
+    return valid_flag, G, m, e2
+
+
+def _calc_fit_coherence(residual, wavelength):
+    """Calculate coherence-like quality from time-function residual displacement."""
+    if wavelength is None:
+        return np.nan
+
+    residual_phase = -4. * np.pi * residual / wavelength
+    return np.abs(np.sum(np.exp(1j * residual_phase))) / residual_phase.size
+
+
+def _is_linear_poly1_only(inps):
+    """True if the time function is intercept + velocity only."""
+    return (
+        int(getattr(inps, 'polynomial', 1)) == 1
+        and not getattr(inps, 'periodic', None)
+        and not getattr(inps, 'stepDate', None)
+        and not getattr(inps, 'polyline', None)
+        and not getattr(inps, 'exp', None)
+        and not getattr(inps, 'log', None)
+    )
+
+
+def _use_spatial_smooth(inps, print_msg=True):
+    """Enable spatial smoothness only for allowPartialDate + linear velocity."""
+    if not getattr(inps, 'allowPartialDate', False):
+        return False
+    if not getattr(inps, 'spatialSmooth', False):
+        return False
+    if not _is_linear_poly1_only(inps):
+        if print_msg:
+            print('WARNING: spatialSmooth requires polynomial=1 without '
+                  'periodic/step/exp/log/polyline; fall back to per-pixel fitting.')
+        return False
+    return True
+
+
+def _read_and_mask_ts_box(inps, atrV, box, num_date):
+    """Read one time-series box, apply referencing, and build the valid-pixel mask."""
+    box_wid = box[2] - box[0]
+    box_len = box[3] - box[1]
+    num_pixel = box_len * box_wid
+    print(f'reading data from file {inps.timeseries_file} ...')
+    ts_data = readfile.read(inps.timeseries_file, box=box)[0]
+
+    if inps.ref_date:
+        print(f'referecing to date: {inps.ref_date}')
+        ref_ind = inps.date_list.index(inps.ref_date)
+        ts_data -= np.tile(ts_data[ref_ind, :, :], (ts_data.shape[0], 1, 1))
+
+    if inps.ref_yx:
+        print(f'referencing to point (y, x): ({inps.ref_yx[0]}, {inps.ref_yx[1]})')
+        ref_box = (inps.ref_yx[1], inps.ref_yx[0], inps.ref_yx[1]+1, inps.ref_yx[0]+1)
+        ref_val = readfile.read(inps.timeseries_file, box=ref_box)[0]
+        ts_data -= np.tile(ref_val.reshape(ts_data.shape[0], 1, 1),
+                           (1, ts_data.shape[1], ts_data.shape[2]))
+
+    ts_data = ts_data[inps.dropDate, :, :].reshape(num_date, -1)
+    if atrV['UNIT'] == 'mm':
+        ts_data *= 1./1000.
+
+    print('skip pixels with zero/nan value in all acquisitions')
+    ts_stack = np.nanmean(ts_data, axis=0)
+    mask = np.multiply(~np.isnan(ts_stack), ts_stack != 0.)
+    del ts_stack
+    if 'REF_Y' in atrV and 'REF_X' in atrV:
+        ry, rx = int(atrV['REF_Y']) - box[1], int(atrV['REF_X']) - box[0]
+        if 0 <= rx < box_wid and 0 <= ry < box_len:
+            mask[ry * box_wid + rx] = 1
+    return ts_data, mask, box_len, box_wid, num_pixel
+
+
+def _fit_coherence_stack(residual, valid, wavelength):
+    """fitCoherence from residuals, ignoring invalid dates (valid is bool mask)."""
+    n_pixel = residual.shape[1]
+    if wavelength is None:
+        return np.full(n_pixel, np.nan, dtype=DATA_TYPE)
+    phase = -4. * np.pi * residual / wavelength
+    cpx = np.exp(1j * phase)
+    cpx[~valid] = 0
+    nobs = np.sum(valid, axis=0).clip(min=1)
+    return (np.abs(np.sum(cpx, axis=0)) / nobs).astype(DATA_TYPE)
+
+
+def _estimate_with_spatial_smooth(inps, atrV, length, width, num_date, seconds,
+                                  model, num_param, wavelength, box_list, num_box,
+                                  start_time):
+    """Joint linear velocity with 4-neighbor coverage-weighted spatial smoothness."""
+    print('estimating linear velocity with spatial smoothness constraint ...')
+    print('using 4-neighbor (azimuth + range) velocity coupling; intercept unconstrained')
+    G = time_func.get_design_matrix4time_func(inps.date_list, model=model, seconds=seconds)
+    if G.shape[1] != 2:
+        raise ValueError('spatialSmooth expects a 2-parameter (intercept, velocity) model')
+
+    ys_all, xs_all, N_all, b_all, valid_all = [], [], [], [], []
+    e2_all, std_all = [], []
+
+    for i, box in enumerate(box_list):
+        if num_box > 1:
+            print(f'\n------- processing patch {i+1} out of {num_box} --------------')
+        ts_data, mask, box_len, box_wid, num_pixel = _read_and_mask_ts_box(
+            inps, atrV, box, num_date)
+        num_pixel2inv = int(np.sum(mask))
+        print('number of pixels to invert: {} out of {} ({:.1f}%)'.format(
+            num_pixel2inv, num_pixel, num_pixel2inv / max(num_pixel, 1) * 100))
+        if num_pixel2inv == 0:
+            continue
+
+        idx = np.where(mask)[0]
+        pix_y = idx // box_wid + box[1]
+        pix_x = idx % box_wid + box[0]
+        ys, xs, N, b, valid, e2, m_std = accumulate_linear_normal_eq(
+            G, ts_data[:, idx], pix_y, pix_x, min_obs=num_param + 1)
+        if ys.size == 0:
+            continue
+        ys_all.append(ys)
+        xs_all.append(xs)
+        N_all.append(N)
+        b_all.append(b)
+        valid_all.append(valid)
+        e2_all.append(e2)
+        std_all.append(m_std)
+
+    m_full = np.full((num_param, length * width), np.nan, dtype=DATA_TYPE)
+    m_std_full = np.full((num_param, length * width), np.nan, dtype=DATA_TYPE)
+    e2_full = np.full(length * width, np.nan, dtype=DATA_TYPE)
+    mask_all = np.zeros(length * width, dtype=np.bool_)
+
+    if ys_all:
+        ys = np.concatenate(ys_all)
+        xs = np.concatenate(xs_all)
+        N = np.concatenate(N_all, axis=0)
+        b = np.concatenate(b_all, axis=0)
+        valid = np.concatenate(valid_all, axis=0)
+        e2 = np.concatenate(e2_all)
+        m_std = np.concatenate(std_all, axis=0)
+        gidx = ys * width + xs
+        mask_all[gidx] = True
+        e2_full[gidx] = e2.astype(DATA_TYPE)
+        m_std_full[:, gidx] = m_std.T.astype(DATA_TYPE)
+
+        strength = float(getattr(inps, 'spatialSmoothStrength', 1.0) or 1.0)
+        m, info, lam = solve_constrained_velocity(
+            N, b, valid, ys, xs, length, width,
+            strength=strength, alpha=1.0, print_msg=True)
+        m_full[:, gidx] = m.T.astype(DATA_TYPE)
+    else:
+        print('WARNING: no estimable pixels for spatially constrained velocity')
+
+    block = [0, length, 0, width]
+    ds_dict = model2hdf5_dataset(model, m_full, m_std_full, mask=mask_all)[0]
+    if inps.uncertaintyQuantification == 'residue':
+        residue = np.full(length * width, np.nan, dtype=DATA_TYPE)
+        residue[mask_all] = np.sqrt(e2_full[mask_all])
+        ds_dict['residue'] = residue
+    for ds_name, data in ds_dict.items():
+        writefile.write_hdf5_block(inps.outfile,
+                                   data=data.reshape(length, width),
+                                   datasetName=ds_name,
+                                   block=block)
+
+    intercept = m_full[0].reshape(length, width)
+    velocity = m_full[1].reshape(length, width)
+
+    if inps.allowPartialDate:
+        fit_coh = np.full((length, width), np.nan, dtype=DATA_TYPE)
+        for i, box in enumerate(box_list):
+            ts_data, mask, box_len, box_wid, num_pixel = _read_and_mask_ts_box(
+                inps, atrV, box, num_date)
+            idx = np.where(mask)[0]
+            if idx.size == 0:
+                continue
+            pix_y = idx // box_wid + box[1]
+            pix_x = idx % box_wid + box[0]
+            a = intercept[pix_y, pix_x]
+            v = velocity[pix_y, pix_x]
+            finite = np.isfinite(a) & np.isfinite(v)
+            if not np.any(finite):
+                continue
+            idx = idx[finite]
+            pix_y, pix_x = pix_y[finite], pix_x[finite]
+            a, v = a[finite], v[finite]
+            d = ts_data[:, idx]
+            valid = np.isfinite(d)
+            pred = a[None, :] * G[:, 0:1] + v[None, :] * G[:, 1:2]
+            residual = d - pred
+            fit_coh[pix_y, pix_x] = _fit_coherence_stack(residual, valid, wavelength)
+        writefile.write_hdf5_block(inps.fitCoherenceFile,
+                                   data=fit_coh,
+                                   datasetName='fitCoherence',
+                                   block=block)
+
+    if inps.save_res:
+        print('calculating the time series residual ...')
+        print(f'remove time functions: {inps.rm_timefuns}')
+        ts_res = np.full((num_date, length * width), np.nan, dtype=np.float32)
+        rm_ds_inds = None if 'all' in inps.rm_timefuns else timefun_names2ds_names(
+            inps.rm_timefuns, ds_dict.keys())[1]
+        for i, box in enumerate(box_list):
+            ts_data, mask, box_len, box_wid, num_pixel = _read_and_mask_ts_box(
+                inps, atrV, box, num_date)
+            idx = np.where(mask)[0]
+            if idx.size == 0:
+                continue
+            pix_y = idx // box_wid + box[1]
+            pix_x = idx % box_wid + box[0]
+            gidx = pix_y * width + pix_x
+            m_pix = m_full[:, gidx]
+            finite = np.isfinite(m_pix[0]) & np.isfinite(m_pix[1])
+            if not np.any(finite):
+                continue
+            idx = idx[finite]
+            gidx = gidx[finite]
+            m_pix = m_pix[:, finite]
+            d = ts_data[:, idx]
+            valid = np.isfinite(d)
+            if rm_ds_inds is None:
+                pred = np.dot(G, m_pix)
+            else:
+                pred = np.dot(G[:, rm_ds_inds], m_pix[rm_ds_inds, :])
+            res = np.full(d.shape, np.nan, dtype=np.float32)
+            res[valid] = (d - pred)[valid]
+            ts_res[:, gidx] = res
+        writefile.write_hdf5_block(
+            inps.res_file,
+            data=ts_res.reshape(num_date, length, width),
+            datasetName='timeseries',
+            block=[0, num_date, 0, length, 0, width],
+        )
+
+    m, s = divmod(time.time() - start_time, 60)
+    print(f'time used: {m:02.0f} mins {s:02.1f} secs.')
+    return inps.outfile
+
+
 def run_timeseries2time_func(inps):
     start_time = time.time()
 
@@ -167,7 +445,15 @@ def run_timeseries2time_func(inps):
     if inps.ref_date:
         atrV['REF_DATE'] = inps.ref_date
 
+    wavelength = float(atr['WAVELENGTH']) if 'WAVELENGTH' in atr.keys() else None
+    if inps.allowPartialDate and wavelength is None:
+        print('WARNING: WAVELENGTH attribute not found; fitCoherence will be set to NaN.')
+
     # time_func_param: config parameter
+    if not hasattr(inps, 'spatialSmooth') or getattr(inps, 'spatialSmooth', None) is None:
+        inps.spatialSmooth = bool(getattr(inps, 'allowPartialDate', False))
+    if getattr(inps, 'spatialSmoothStrength', None) is None:
+        inps.spatialSmoothStrength = 1.0
     print(f'add/update the following configuration metadata:\n{config_keys}')
     for key in config_keys:
         atrV[key_prefix+key] = str(vars(inps)[key])
@@ -183,6 +469,18 @@ def run_timeseries2time_func(inps):
                           metadata=atrV,
                           ds_name_dict=ds_name_dict,
                           ds_unit_dict=ds_unit_dict)
+
+    # fit coherence: quality of time-function fitting in partial-date mode
+    if inps.allowPartialDate:
+        atrF = dict(atrV)
+        atrF['FILE_TYPE'] = 'fitCoherence'
+        atrF['UNIT'] = '1'
+        ds_name_dict = {'fitCoherence' : [np.float32, (length, width), None]}
+        ds_unit_dict = {'fitCoherence' : '1'}
+        writefile.layout_hdf5(inps.fitCoherenceFile,
+                              metadata=atrF,
+                              ds_name_dict=ds_name_dict,
+                              ds_unit_dict=ds_unit_dict)
 
     # timeseries_res: attributes + instantiate output file
     if inps.save_res:
@@ -214,6 +512,11 @@ def run_timeseries2time_func(inps):
         print_msg=True,
     )
 
+    if _use_spatial_smooth(inps):
+        return _estimate_with_spatial_smooth(
+            inps, atrV, length, width, num_date, seconds, model, num_param,
+            wavelength, box_list, num_box, start_time)
+
     # loop for block-by-block IO
     for i, box in enumerate(box_list):
         box_wid = box[2] - box[0]
@@ -224,9 +527,9 @@ def run_timeseries2time_func(inps):
             print(f'box width:  {box_wid}')
             print(f'box length: {box_len}')
 
-        # initiate output
-        m = np.zeros((num_param, num_pixel), dtype=DATA_TYPE)
-        m_std = np.zeros((num_param, num_pixel), dtype=DATA_TYPE)
+        # initiate output (NaN = not estimated)
+        m = np.full((num_param, num_pixel), np.nan, dtype=DATA_TYPE)
+        m_std = np.full((num_param, num_pixel), np.nan, dtype=DATA_TYPE)
 
         # read input
         print(f'reading data from file {inps.timeseries_file} ...')
@@ -287,19 +590,49 @@ def run_timeseries2time_func(inps):
         #    mask *= num_std_nan == 0
         #    del num_std_nan
 
-        ts_data = ts_data[:, mask]
         num_pixel2inv = int(np.sum(mask))
         idx_pixel2inv = np.where(mask)[0]
         print('number of pixels to invert: {} out of {} ({:.1f}%)'.format(
             num_pixel2inv, num_pixel, num_pixel2inv/num_pixel*100))
 
-        # go to next if no valid pixel found
+        # write NaN for empty boxes and continue
         if num_pixel2inv == 0:
+            block = [box[1], box[3], box[0], box[2]]
+            ds_dict = model2hdf5_dataset(model, m, m_std, mask=mask)[0]
+            if inps.uncertaintyQuantification == 'residue':
+                ds_dict['residue'] = np.full(num_pixel, np.nan, dtype=DATA_TYPE)
+            for ds_name, data in ds_dict.items():
+                writefile.write_hdf5_block(inps.outfile,
+                                           data=data.reshape(box_len, box_wid),
+                                           datasetName=ds_name,
+                                           block=block)
+            if inps.allowPartialDate:
+                writefile.write_hdf5_block(inps.fitCoherenceFile,
+                                           data=np.full((box_len, box_wid), np.nan, dtype=DATA_TYPE),
+                                           datasetName='fitCoherence',
+                                           block=block)
             continue
 
 
         ### estimation / solve Gm = d
         print('estimating time functions via linalg.lstsq ...')
+        if inps.allowPartialDate:
+            ts_data2inv = ts_data[:, mask]
+            obs_flag = np.isfinite(ts_data2inv)
+            mask_all_date = np.all(obs_flag, axis=0)
+            mask_part_date = np.any(obs_flag, axis=0) & ~mask_all_date
+            idx_pixel2inv_all = idx_pixel2inv[mask_all_date]
+            idx_pixel2inv_part = idx_pixel2inv[mask_part_date]
+            num_pixel2inv_all = int(np.sum(mask_all_date))
+            num_pixel2inv_part = int(np.sum(mask_part_date))
+            print('pixels with valid observations in all dates: {} ({:.1f}%)'.format(
+                num_pixel2inv_all, num_pixel2inv_all/num_pixel2inv*100))
+            print('pixels with valid observations in some dates: {} ({:.1f}%)'.format(
+                num_pixel2inv_part, num_pixel2inv_part/num_pixel2inv*100))
+            e2 = np.full(num_pixel, np.nan, dtype=DATA_TYPE)
+            fit_coh = np.full(num_pixel, np.nan, dtype=DATA_TYPE)
+        else:
+            ts_data = ts_data[:, mask]
 
         if inps.uncertaintyQuantification == 'bootstrap':
             ## option 1 - least squares with bootstrapping
@@ -340,11 +673,49 @@ def run_timeseries2time_func(inps):
 
         else:
             ## option 2 - least squares with uncertainty propagation
-            G, m[:, mask], e2 = time_func.estimate_time_func(
-                model=model,
-                date_list=inps.date_list,
-                dis_ts=ts_data,
-                seconds=seconds)
+            G = time_func.get_design_matrix4time_func(inps.date_list, model=model, seconds=seconds)
+            if inps.allowPartialDate:
+                if num_pixel2inv_all > 0:
+                    G, mi, e2i = time_func.estimate_time_func(
+                        model=model,
+                        date_list=inps.date_list,
+                        dis_ts=ts_data2inv[:, mask_all_date],
+                        seconds=seconds)
+                    m[:, idx_pixel2inv_all] = mi
+                    e2[idx_pixel2inv_all] = e2i
+                    residual = ts_data[:, idx_pixel2inv_all] - np.dot(G, mi)
+                    residual_phase = -4. * np.pi * residual / wavelength if wavelength is not None else None
+                    if residual_phase is not None:
+                        fit_coh[idx_pixel2inv_all] = np.abs(np.sum(np.exp(1j * residual_phase), axis=0)) / num_date
+
+                if num_pixel2inv_part > 0:
+                    num_pixel_skip = 0
+                    print('estimating time functions for pixels with partial-date observations pixel-by-pixel ...')
+                    prog_bar = ptime.progressBar(maxValue=num_pixel2inv_part)
+                    for j, idx in enumerate(idx_pixel2inv_part):
+                        valid_flag, Gi, mi, e2i = _estimate_part_date_pixel(
+                            model=model,
+                            date_list=inps.date_list,
+                            dis_ts=ts_data[:, idx],
+                            seconds=seconds,
+                        )
+                        if valid_flag is None:
+                            num_pixel_skip += 1
+                        else:
+                            m[:, idx] = mi.flatten()
+                            e2[idx] = np.array(e2i).reshape(-1)[0]
+                            residual = ts_data[valid_flag, idx] - np.dot(Gi, mi).flatten()
+                            fit_coh[idx] = _calc_fit_coherence(residual, wavelength)
+
+                        prog_bar.update(j+1, every=200, suffix=f'{j+1}/{num_pixel2inv_part} pixels')
+                    prog_bar.close()
+                    print(f'number of partial-date pixels skipped due to insufficient observations/rank: {num_pixel_skip}')
+            else:
+                G, m[:, mask], e2 = time_func.estimate_time_func(
+                    model=model,
+                    date_list=inps.date_list,
+                    dis_ts=ts_data,
+                    seconds=seconds)
             #del ts_data
 
             ## Compute the covariance matrix for model parameters:
@@ -404,9 +775,31 @@ def run_timeseries2time_func(inps):
             elif inps.uncertaintyQuantification == 'residue':
                 # option 2.3 - assume obs errors following normal dist. in time
                 print('estimating time functions STD from time-series fitting residual ...')
-                G_inv = linalg.inv(np.dot(G.T, G))
-                m_var = e2.reshape(1, -1) / (num_date - num_param)
-                m_std[:, mask] = np.sqrt(np.dot(np.diag(G_inv).reshape(-1, 1), m_var))
+                if inps.allowPartialDate:
+                    if num_pixel2inv_all > 0:
+                        G_inv = linalg.inv(np.dot(G.T, G))
+                        m_var = e2[idx_pixel2inv_all].reshape(1, -1) / (num_date - num_param)
+                        m_std[:, idx_pixel2inv_all] = np.sqrt(np.dot(np.diag(G_inv).reshape(-1, 1), m_var))
+
+                    if num_pixel2inv_part > 0:
+                        prog_bar = ptime.progressBar(maxValue=num_pixel2inv_part)
+                        for j, idx in enumerate(idx_pixel2inv_part):
+                            valid_flag, valid_date_list, Gi = _get_part_date_lstsq_inputs(
+                                model=model,
+                                date_list=inps.date_list,
+                                dis_ts=ts_data[:, idx],
+                                seconds=seconds,
+                            )
+                            if valid_flag is not None:
+                                G_inv = linalg.inv(np.dot(Gi.T, Gi))
+                                m_var = e2[idx] / (len(valid_date_list) - num_param)
+                                m_std[:, idx] = np.sqrt(np.diag(G_inv) * m_var)
+                            prog_bar.update(j+1, every=200, suffix=f'{j+1}/{num_pixel2inv_part} pixels')
+                        prog_bar.close()
+                else:
+                    G_inv = linalg.inv(np.dot(G.T, G))
+                    m_var = e2.reshape(1, -1) / (num_date - num_param)
+                    m_std[:, mask] = np.sqrt(np.dot(np.diag(G_inv).reshape(-1, 1), m_var))
 
                 # simplified form for linear velocity (without matrix linear algebra)
                 # equation (10) in Fattahi & Amelung (2015, JGR)
@@ -419,13 +812,22 @@ def run_timeseries2time_func(inps):
         ds_dict = model2hdf5_dataset(model, m, m_std, mask=mask)[0]
         # save dataset: residue
         if inps.uncertaintyQuantification == 'residue':
-            ds_dict['residue'] = np.zeros(num_pixel, dtype=DATA_TYPE)
-            ds_dict['residue'][mask] = np.sqrt(e2)
+            ds_dict['residue'] = np.full(num_pixel, np.nan, dtype=DATA_TYPE)
+            if inps.allowPartialDate:
+                ds_dict['residue'][mask] = np.sqrt(e2[mask])
+            else:
+                ds_dict['residue'][mask] = np.sqrt(e2)
 
         for ds_name, data in ds_dict.items():
             writefile.write_hdf5_block(inps.outfile,
                                        data=data.reshape(box_len, box_wid),
                                        datasetName=ds_name,
+                                       block=block)
+
+        if inps.allowPartialDate:
+            writefile.write_hdf5_block(inps.fitCoherenceFile,
+                                       data=fit_coh.reshape(box_len, box_wid),
+                                       datasetName='fitCoherence',
                                        block=block)
 
         # write - residual file
@@ -436,11 +838,42 @@ def run_timeseries2time_func(inps):
 
             # calculate the time-series residual
             print(f'remove time functions: {inps.rm_timefuns}')
-            if 'all' in inps.rm_timefuns:
-                ts_res[:, mask] = ts_data - np.dot(G, m)[:, mask]
+            if inps.allowPartialDate:
+                rm_ds_inds = None if 'all' in inps.rm_timefuns else timefun_names2ds_names(inps.rm_timefuns, ds_dict.keys())[1]
+                if num_pixel2inv_all > 0:
+                    if rm_ds_inds is None:
+                        ts_res[:, idx_pixel2inv_all] = ts_data[:, idx_pixel2inv_all] - np.dot(G, m[:, idx_pixel2inv_all])
+                    else:
+                        ts_res[:, idx_pixel2inv_all] = (
+                            ts_data[:, idx_pixel2inv_all]
+                            - np.dot(G[:, rm_ds_inds], m[rm_ds_inds, :][:, idx_pixel2inv_all])
+                        )
+
+                if num_pixel2inv_part > 0:
+                    prog_bar = ptime.progressBar(maxValue=num_pixel2inv_part)
+                    for j, idx in enumerate(idx_pixel2inv_part):
+                        valid_flag, valid_date_list, Gi = _get_part_date_lstsq_inputs(
+                            model=model,
+                            date_list=inps.date_list,
+                            dis_ts=ts_data[:, idx],
+                            seconds=seconds,
+                        )
+                        if valid_flag is not None:
+                            if rm_ds_inds is None:
+                                ts_res[valid_flag, idx] = ts_data[valid_flag, idx] - np.dot(Gi, m[:, idx])
+                            else:
+                                ts_res[valid_flag, idx] = (
+                                    ts_data[valid_flag, idx]
+                                    - np.dot(Gi[:, rm_ds_inds], m[rm_ds_inds, idx])
+                                )
+                        prog_bar.update(j+1, every=200, suffix=f'{j+1}/{num_pixel2inv_part} pixels')
+                    prog_bar.close()
             else:
-                rm_ds_inds = timefun_names2ds_names(inps.rm_timefuns, ds_dict.keys())[1]
-                ts_res[:, mask] = ts_data - np.dot(G[:, rm_ds_inds], m[rm_ds_inds, :])[:, mask]
+                if 'all' in inps.rm_timefuns:
+                    ts_res[:, mask] = ts_data - np.dot(G, m)[:, mask]
+                else:
+                    rm_ds_inds = timefun_names2ds_names(inps.rm_timefuns, ds_dict.keys())[1]
+                    ts_res[:, mask] = ts_data - np.dot(G[:, rm_ds_inds], m[rm_ds_inds, :])[:, mask]
 
             # write to HDF5 file
             writefile.write_hdf5_block(inps.res_file,
@@ -584,11 +1017,13 @@ def model2hdf5_dataset(model, m=None, m_std=None, mask=None, ds_shape=None, resi
             coef_cos = m[p0 + 2*i, :]
             coef_sin = m[p0 + 2*i + 1, :]
             period_amp = np.sqrt(coef_cos**2 + coef_sin**2)
-            period_pha = np.zeros(num_pixel, dtype=DATA_TYPE)
+            period_pha = np.full(num_pixel, np.nan, dtype=DATA_TYPE)
             # avoid divided by zero warning
             if not np.all(coef_sin[mask] == 0):
                 # use atan2, instead of atan, to get phase within [-pi, pi]
                 period_pha[mask] = np.arctan2(coef_cos[mask], coef_sin[mask])
+            else:
+                period_pha[mask] = 0.
 
             # assign ds_dict
             for dsName, data in zip(dsNames, [period_amp, period_pha]):

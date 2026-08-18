@@ -73,7 +73,8 @@ def get_dest_option_str_dict(parser):
     for action in action_list:
         key = action.dest
         val = action.option_strings
-        dest_opt_str[key] = val
+        dest_opt_str.setdefault(key, [])
+        dest_opt_str[key] += val
     return dest_opt_str
 
 

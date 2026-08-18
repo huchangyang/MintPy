@@ -38,6 +38,11 @@ EXAMPLE = """example:
   timeseries2velocity.py timeseries_ERA5_demErr.h5 --poly 1 --log 20170910 60.4 200 --log 20171026 200.7
   timeseries2velocity.py timeseries_ERA5_demErr.h5 --poly 1 --polyline 20190101 20200501
 
+  # partial-date velocity with spatial smoothness (coverage-step stripes)
+  timeseries2velocity.py timeseries.h5 --allow-partial-date
+  timeseries2velocity.py timeseries.h5 --allow-partial-date --no-spatial-smooth
+  timeseries2velocity.py timeseries.h5 --allow-partial-date --spatial-smooth-strength 2.0
+
   # uncertainty quantification of the estimated time functions
   timeseries2velocity.py timeseries_ERA5_demErr.h5 --uq residue
   timeseries2velocity.py timeseries_ERA5_demErr.h5 --uq covariance --ts-cov timeseriesCov.h5
@@ -88,6 +93,22 @@ def create_parser(subparsers=None):
                       help='date(s) not included in time function estimation, i.e.:\n' +
                            '--exclude 20040502 20060708 20090103\n' +
                            '--exclude exclude_date.txt\n'+DROP_DATE_TXT)
+    date.add_argument('--allow-partial-date', dest='allowPartialDate', action='store_true',
+                      help='Use each pixel\'s finite acquisitions for time function estimation, '
+                           'allowing pixels with missing dates to be inverted (default: %(default)s).')
+    date.add_argument('--fit-coh-file', dest='fitCoherenceFile',
+                      help='Output file name for fit coherence from time-function residuals '
+                           '(default: fitCoherence.h5 when --allow-partial-date is enabled).')
+    smooth = parser.add_mutually_exclusive_group()
+    smooth.add_argument('--spatial-smooth', dest='spatialSmooth', action='store_true',
+                        help='Couple neighboring pixels\' velocity during partial-date fitting '
+                             '(4-neighbor, coverage-weighted). Default: on when --allow-partial-date is set.')
+    smooth.add_argument('--no-spatial-smooth', dest='spatialSmooth', action='store_false',
+                        help='Disable spatial smoothness on velocity (independent per-pixel fit).')
+    parser.set_defaults(spatialSmooth=None)
+    date.add_argument('--spatial-smooth-strength', dest='spatialSmoothStrength', type=float, default=1.0,
+                      help='Relative strength of spatial smoothness (default: %(default)s). '
+                           'Scaled by the median velocity normal-equation weight.')
 
     # Uncertainty quantification
     uq = parser.add_argument_group('Uncertainty quantification (UQ)', 'Estimating the time function parameters STD')
@@ -165,6 +186,15 @@ def cmd_line_parse(iargs=None):
             print('WARNING: NO time series covariance file found!')
             print('Change the uncertainty quantification method from covariance to residue, and continue.')
 
+    if inps.allowPartialDate and inps.uncertaintyQuantification != 'residue':
+        raise ValueError('--allow-partial-date currently supports --uq residue only!')
+
+    # spatialSmooth: auto follows allowPartialDate
+    if inps.spatialSmooth is None:
+        inps.spatialSmooth = bool(inps.allowPartialDate)
+    if inps.spatialSmoothStrength is None:
+        inps.spatialSmoothStrength = 1.0
+
     # check: --ref-lalo option (translate to --ref-yx)
     if inps.ref_lalo:
         coord = ut.coordinate(atr)
@@ -208,6 +238,10 @@ def cmd_line_parse(iargs=None):
         inps.res_file = f'{os.path.splitext(inps.timeseries_file)[0]}_{suffix}.h5'
         print(f'output residual time series file: {inps.res_file}')
 
+    if inps.allowPartialDate and not inps.fitCoherenceFile:
+        out_dir = os.path.dirname(inps.outfile)
+        inps.fitCoherenceFile = os.path.join(out_dir, 'fitCoherence.h5') if out_dir else 'fitCoherence.h5'
+
     return inps
 
 
@@ -226,7 +260,21 @@ def read_template2inps(template_file, inps):
     key_list = [i for i in list(iDict.keys()) if key_prefix+i in template.keys()]
     for key in key_list:
         value = template[key_prefix+key]
-        if value:
+        if key in ['allowPartialDate']:
+            iDict[key] = value if isinstance(value, bool) else str(value).lower() in ['yes', 'true']
+
+        elif key in ['spatialSmooth']:
+            if value in [None] or (isinstance(value, str) and str(value).lower() == 'auto'):
+                iDict[key] = None
+            elif isinstance(value, bool):
+                iDict[key] = value
+            else:
+                iDict[key] = str(value).lower() in ['yes', 'true', '1']
+
+        elif key in ['spatialSmoothStrength'] and value not in [None, False]:
+            iDict[key] = float(value)
+
+        elif value:
             if key in ['startDate', 'endDate']:
                 iDict[key] = ptime.yyyymmdd(value)
 
