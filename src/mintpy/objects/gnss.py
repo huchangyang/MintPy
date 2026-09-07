@@ -850,7 +850,7 @@ class GNSS:
         Returns:    dates         - 1D np.ndarray, datetime.datetime object
                     dis           - 1D np.ndarray, displacement in meters
         """
-        # retrieve displacement data (use requested date range, usually from InSAR)
+        # retrieve displacement data (requested date range, usually InSAR START/END_DATE)
         dates, dis = self.get_los_displacement(
             geom_obj,
             start_date=start_date,
@@ -860,21 +860,10 @@ class GNSS:
             horz_az_angle=horz_az_angle,
         )[:2]
 
-        # if requested range has no/few points (e.g. GNSS and InSAR periods don't overlap),
-        # retry with full GNSS range so we still get a velocity
-        if len(dates) <= 2 and (start_date or end_date):
-            dates, dis = self.get_los_displacement(
-                geom_obj,
-                start_date=None,
-                end_date=None,
-                ref_site=ref_site,
-                gnss_comp=gnss_comp,
-                horz_az_angle=horz_az_angle,
-            )[:2]
-
         # displacement -> velocity
         # if 1. num of observations > 2 AND
         #    2. time overlap > 1/4 (when using requested range)
+        # no fallback to the full GNSS span: that is --gnss-full-span only
         dis2vel = True
         if len(dates) <= 2:
             dis2vel = False
