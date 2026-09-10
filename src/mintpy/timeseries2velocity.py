@@ -84,8 +84,9 @@ def read_date_info(inps):
 
     Parameters: inps - Namespace
     Returns:    inps - Namespace, adding the following new fields:
-                       date_list - list of str, dates used for estimation
-                       dropDate  - 1D np.ndarray in bool in size of all available dates
+                       all_date_list - list of str, all dates in the input file
+                       date_list     - list of str, dates used for estimation
+                       dropDate      - 1D np.ndarray in bool in size of all available dates
     """
     # initiate and open time-series file object
     ftype = readfile.read_attribute(inps.timeseries_file)['FILE_TYPE']
@@ -117,6 +118,7 @@ def read_date_info(inps):
             ex_date_list = sorted(list(set(ex_date_list)))
 
     # dates used for estimation - inps.date_list
+    inps.all_date_list = list(ts_obj.dateList)
     inps.date_list = [i for i in ts_obj.dateList if i not in ex_date_list]
 
     # flag array for ts data reading
@@ -172,6 +174,84 @@ def _estimate_part_date_pixel(model, date_list, dis_ts, seconds=0):
     return valid_flag, G, m, e2
 
 
+def _estimate_time_func_grouped(G, dis_ts, min_obs=None, print_msg=False):
+    """OLS time-function fit grouped by identical observation masks.
+
+    Pixels sharing the same finite-date pattern reuse one design matrix, so
+    partial-date inversion with extra parameters (e.g. step) stays vectorized.
+
+    Parameters: G        - 2D np.ndarray, full-date design matrix (num_date, num_param)
+                dis_ts   - 2D np.ndarray, displacement (num_date, num_pixel), NaN = missing
+                min_obs  - int, minimum finite dates (default num_param + 1 for residue STD)
+                print_msg- bool
+    Returns:    m        - 2D np.ndarray (num_param, num_pixel), NaN if skipped
+                e2       - 1D np.ndarray (num_pixel,), residual sum of squares
+                m_std    - 2D np.ndarray (num_param, num_pixel), residue-based STD
+                n_skip   - int, pixels skipped for insufficient observations/rank
+                valid    - 2D np.ndarray bool (num_date, num_pixel)
+    """
+    G = np.asarray(G, dtype=np.float64)
+    dis_ts = np.asarray(dis_ts)
+    if dis_ts.ndim == 1:
+        dis_ts = dis_ts.reshape(-1, 1)
+    num_date, num_param = G.shape
+    num_pixel = dis_ts.shape[1]
+    if min_obs is None:
+        min_obs = num_param + 1
+
+    m = np.full((num_param, num_pixel), np.nan, dtype=np.float64)
+    e2 = np.full(num_pixel, np.nan, dtype=np.float64)
+    m_std = np.full((num_param, num_pixel), np.nan, dtype=np.float64)
+    valid = np.isfinite(dis_ts)
+    n_skip = 0
+
+    if num_pixel == 0:
+        return (m.astype(DATA_TYPE), e2.astype(DATA_TYPE), m_std.astype(DATA_TYPE),
+                n_skip, valid)
+
+    packed = np.packbits(np.ascontiguousarray(valid.T), axis=1)
+    _, inv = np.unique(packed, axis=0, return_inverse=True)
+    n_group = int(inv.max()) + 1
+    if print_msg:
+        print('estimating time functions grouped by observation mask '
+              f'({n_group} unique masks, {num_pixel} pixels) ...')
+
+    for cid in range(n_group):
+        sel = inv == cid
+        valid_i = valid[:, sel][:, 0]
+        n_i = int(np.count_nonzero(valid_i))
+        n_g = int(np.count_nonzero(sel))
+        if n_i < int(min_obs):
+            n_skip += n_g
+            continue
+        Gv = G[valid_i]
+        if np.linalg.matrix_rank(Gv) < num_param:
+            n_skip += n_g
+            continue
+        d = np.asarray(dis_ts[np.ix_(valid_i, sel)], dtype=np.float64)
+        mi, e2i = linalg.lstsq(Gv, d, cond=None)[:2]
+        e2i = np.asarray(e2i, dtype=np.float64).reshape(-1)
+        if e2i.size != n_g:
+            resid = d - Gv @ mi
+            e2i = np.sum(resid * resid, axis=0)
+        dof = n_i - num_param
+        try:
+            ginv_diag = np.diag(np.linalg.inv(Gv.T @ Gv))
+        except np.linalg.LinAlgError:
+            n_skip += n_g
+            continue
+        m[:, sel] = mi
+        e2[sel] = e2i
+        m_std[:, sel] = np.sqrt(np.maximum(ginv_diag[:, None] * (e2i / dof)[None, :], 0.0))
+
+    if print_msg:
+        print('number of pixels skipped due to insufficient observations/rank: '
+              f'{n_skip}')
+
+    return (m.astype(DATA_TYPE), e2.astype(DATA_TYPE), m_std.astype(DATA_TYPE),
+            n_skip, valid)
+
+
 def _calc_fit_coherence(residual, wavelength):
     """Calculate coherence-like quality from time-function residual displacement."""
     if wavelength is None:
@@ -202,9 +282,36 @@ def _use_spatial_smooth(inps, print_msg=True):
     if not _is_linear_poly1_only(inps):
         if print_msg:
             print('WARNING: spatialSmooth requires polynomial=1 without '
-                  'periodic/step/exp/log/polyline; fall back to per-pixel fitting.')
+                  'periodic/step/exp/log/polyline; fall back to grouped fitting.')
         return False
     return True
+
+
+def _apply_temporal_reference(ts_data, inps):
+    """Subtract the reference-date slice from an unfiltered time-series cube.
+
+    The first axis of ts_data follows the input file date list, including dates
+    later dropped by excludeDate / startDate / endDate.
+    """
+    if not inps.ref_date:
+        return ts_data
+
+    all_dates = getattr(inps, 'all_date_list', None) or list(inps.date_list)
+    if inps.ref_date not in all_dates:
+        print(f'WARNING: ref date {inps.ref_date} is not in the input file; '
+              'skip temporal referencing.')
+        return ts_data
+    if ts_data.shape[0] != len(all_dates):
+        raise ValueError(f'time-series length {ts_data.shape[0]} does not match '
+                         f'file date list ({len(all_dates)})')
+
+    ref_ind = all_dates.index(inps.ref_date)
+    msg = f'referencing to date: {inps.ref_date}'
+    if inps.ref_date not in inps.date_list:
+        msg += ' (excluded from time-function estimation)'
+    print(msg)
+    ts_data = ts_data - np.tile(ts_data[ref_ind, :, :], (ts_data.shape[0], 1, 1))
+    return ts_data
 
 
 def _read_and_mask_ts_box(inps, atrV, box, num_date):
@@ -215,10 +322,7 @@ def _read_and_mask_ts_box(inps, atrV, box, num_date):
     print(f'reading data from file {inps.timeseries_file} ...')
     ts_data = readfile.read(inps.timeseries_file, box=box)[0]
 
-    if inps.ref_date:
-        print(f'referecing to date: {inps.ref_date}')
-        ref_ind = inps.date_list.index(inps.ref_date)
-        ts_data -= np.tile(ts_data[ref_ind, :, :], (ts_data.shape[0], 1, 1))
+    ts_data = _apply_temporal_reference(ts_data, inps)
 
     if inps.ref_yx:
         print(f'referencing to point (y, x): ({inps.ref_yx[0]}, {inps.ref_yx[1]})')
@@ -537,10 +641,7 @@ def run_timeseries2time_func(inps):
 
         # referencing in time and space
         # for file w/o reference info. e.g. ERA5.h5
-        if inps.ref_date:
-            print(f'referecing to date: {inps.ref_date}')
-            ref_ind = inps.date_list.index(inps.ref_date)
-            ts_data -= np.tile(ts_data[ref_ind, :, :], (ts_data.shape[0], 1, 1))
+        ts_data = _apply_temporal_reference(ts_data, inps)
 
         if inps.ref_yx:
             print(f'referencing to point (y, x): ({inps.ref_yx[0]}, {inps.ref_yx[1]})')
@@ -668,48 +769,23 @@ def run_timeseries2time_func(inps):
             del m_boot
 
             # get design matrix to calculate the residual time series
-            G = time_func.get_design_matrix4time_func(inps.date_list, model=model, ref_date=inps.ref_date, seconds=seconds)
+            G = time_func.get_design_matrix4time_func(
+                inps.date_list, model=model,
+                ref_date=inps.ref_date if inps.ref_date in inps.date_list else None,
+                seconds=seconds)
 
 
         else:
             ## option 2 - least squares with uncertainty propagation
             G = time_func.get_design_matrix4time_func(inps.date_list, model=model, seconds=seconds)
+            m_std_grouped = None
             if inps.allowPartialDate:
-                if num_pixel2inv_all > 0:
-                    G, mi, e2i = time_func.estimate_time_func(
-                        model=model,
-                        date_list=inps.date_list,
-                        dis_ts=ts_data2inv[:, mask_all_date],
-                        seconds=seconds)
-                    m[:, idx_pixel2inv_all] = mi
-                    e2[idx_pixel2inv_all] = e2i
-                    residual = ts_data[:, idx_pixel2inv_all] - np.dot(G, mi)
-                    residual_phase = -4. * np.pi * residual / wavelength if wavelength is not None else None
-                    if residual_phase is not None:
-                        fit_coh[idx_pixel2inv_all] = np.abs(np.sum(np.exp(1j * residual_phase), axis=0)) / num_date
-
-                if num_pixel2inv_part > 0:
-                    num_pixel_skip = 0
-                    print('estimating time functions for pixels with partial-date observations pixel-by-pixel ...')
-                    prog_bar = ptime.progressBar(maxValue=num_pixel2inv_part)
-                    for j, idx in enumerate(idx_pixel2inv_part):
-                        valid_flag, Gi, mi, e2i = _estimate_part_date_pixel(
-                            model=model,
-                            date_list=inps.date_list,
-                            dis_ts=ts_data[:, idx],
-                            seconds=seconds,
-                        )
-                        if valid_flag is None:
-                            num_pixel_skip += 1
-                        else:
-                            m[:, idx] = mi.flatten()
-                            e2[idx] = np.array(e2i).reshape(-1)[0]
-                            residual = ts_data[valid_flag, idx] - np.dot(Gi, mi).flatten()
-                            fit_coh[idx] = _calc_fit_coherence(residual, wavelength)
-
-                        prog_bar.update(j+1, every=200, suffix=f'{j+1}/{num_pixel2inv_part} pixels')
-                    prog_bar.close()
-                    print(f'number of partial-date pixels skipped due to insufficient observations/rank: {num_pixel_skip}')
+                mi, e2i, m_std_grouped, num_pixel_skip, valid_i = _estimate_time_func_grouped(
+                    G, ts_data2inv, min_obs=num_param + 1, print_msg=True)
+                m[:, idx_pixel2inv] = mi
+                e2[idx_pixel2inv] = e2i
+                residual = ts_data2inv - np.dot(G, mi)
+                fit_coh[idx_pixel2inv] = _fit_coherence_stack(residual, valid_i, wavelength)
             else:
                 G, m[:, mask], e2 = time_func.estimate_time_func(
                     model=model,
@@ -776,26 +852,7 @@ def run_timeseries2time_func(inps):
                 # option 2.3 - assume obs errors following normal dist. in time
                 print('estimating time functions STD from time-series fitting residual ...')
                 if inps.allowPartialDate:
-                    if num_pixel2inv_all > 0:
-                        G_inv = linalg.inv(np.dot(G.T, G))
-                        m_var = e2[idx_pixel2inv_all].reshape(1, -1) / (num_date - num_param)
-                        m_std[:, idx_pixel2inv_all] = np.sqrt(np.dot(np.diag(G_inv).reshape(-1, 1), m_var))
-
-                    if num_pixel2inv_part > 0:
-                        prog_bar = ptime.progressBar(maxValue=num_pixel2inv_part)
-                        for j, idx in enumerate(idx_pixel2inv_part):
-                            valid_flag, valid_date_list, Gi = _get_part_date_lstsq_inputs(
-                                model=model,
-                                date_list=inps.date_list,
-                                dis_ts=ts_data[:, idx],
-                                seconds=seconds,
-                            )
-                            if valid_flag is not None:
-                                G_inv = linalg.inv(np.dot(Gi.T, Gi))
-                                m_var = e2[idx] / (len(valid_date_list) - num_param)
-                                m_std[:, idx] = np.sqrt(np.diag(G_inv) * m_var)
-                            prog_bar.update(j+1, every=200, suffix=f'{j+1}/{num_pixel2inv_part} pixels')
-                        prog_bar.close()
+                    m_std[:, idx_pixel2inv] = m_std_grouped
                 else:
                     G_inv = linalg.inv(np.dot(G.T, G))
                     m_var = e2.reshape(1, -1) / (num_date - num_param)
@@ -840,34 +897,17 @@ def run_timeseries2time_func(inps):
             print(f'remove time functions: {inps.rm_timefuns}')
             if inps.allowPartialDate:
                 rm_ds_inds = None if 'all' in inps.rm_timefuns else timefun_names2ds_names(inps.rm_timefuns, ds_dict.keys())[1]
-                if num_pixel2inv_all > 0:
-                    if rm_ds_inds is None:
-                        ts_res[:, idx_pixel2inv_all] = ts_data[:, idx_pixel2inv_all] - np.dot(G, m[:, idx_pixel2inv_all])
-                    else:
-                        ts_res[:, idx_pixel2inv_all] = (
-                            ts_data[:, idx_pixel2inv_all]
-                            - np.dot(G[:, rm_ds_inds], m[rm_ds_inds, :][:, idx_pixel2inv_all])
-                        )
-
-                if num_pixel2inv_part > 0:
-                    prog_bar = ptime.progressBar(maxValue=num_pixel2inv_part)
-                    for j, idx in enumerate(idx_pixel2inv_part):
-                        valid_flag, valid_date_list, Gi = _get_part_date_lstsq_inputs(
-                            model=model,
-                            date_list=inps.date_list,
-                            dis_ts=ts_data[:, idx],
-                            seconds=seconds,
-                        )
-                        if valid_flag is not None:
-                            if rm_ds_inds is None:
-                                ts_res[valid_flag, idx] = ts_data[valid_flag, idx] - np.dot(Gi, m[:, idx])
-                            else:
-                                ts_res[valid_flag, idx] = (
-                                    ts_data[valid_flag, idx]
-                                    - np.dot(Gi[:, rm_ds_inds], m[rm_ds_inds, idx])
-                                )
-                        prog_bar.update(j+1, every=200, suffix=f'{j+1}/{num_pixel2inv_part} pixels')
-                    prog_bar.close()
+                d = ts_data[:, idx_pixel2inv]
+                valid_res = np.isfinite(d)
+                m_pix = m[:, idx_pixel2inv]
+                if rm_ds_inds is None:
+                    pred = np.dot(G, m_pix)
+                else:
+                    pred = np.dot(G[:, rm_ds_inds], m_pix[rm_ds_inds, :])
+                res = np.full(d.shape, np.nan, dtype=np.float32)
+                ok = valid_res & np.isfinite(m_pix[0])[None, :]
+                res[ok] = (d - pred)[ok]
+                ts_res[:, idx_pixel2inv] = res
             else:
                 if 'all' in inps.rm_timefuns:
                     ts_res[:, mask] = ts_data - np.dot(G, m)[:, mask]
