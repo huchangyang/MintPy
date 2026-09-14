@@ -108,28 +108,6 @@ def search_gnss(SNWE, start_date=None, end_date=None, source='UNR', site_list_fi
     return sites['site'][idx], sites['lat'][idx], sites['lon'][idx]
 
 
-def lookup_gnss_site(site, source='UNR', site_list_file=None, print_msg=False):
-    """Look up one GNSS site in the source catalog (no spatial filter).
-
-    Returns: name, lat, lon  or  (None, None, None) if not found
-    """
-    names, lats, lons = search_gnss(
-        SNWE=(-90., 90., -180., 180.),
-        start_date=None,
-        end_date=None,
-        source=source,
-        site_list_file=site_list_file,
-        min_num_solution=None,
-        print_msg=print_msg,
-    )
-    site_u = str(site).upper()
-    idx = np.where(np.array([str(s).upper() for s in names]) == site_u)[0]
-    if idx.size == 0:
-        return None, None, None
-    i = int(idx[0])
-    return str(names[i]), float(lats[i]), float(lons[i])
-
-
 def dload_site_list(out_file=None, source='UNR', print_msg=True) -> str:
     """Download single file with list of GNSS site locations.
     For TGM, fetch the map page and parse embedded JSON to build the site list.
@@ -774,19 +752,9 @@ class GNSS:
         return self.dis_los, self.std_los
 
 
-    def _los_geometry_from_metadata(self, atr, print_msg=False):
-        """Scene-mean LOS geometry when the site is outside the raster."""
-        if 'CENTER_INCIDENCE_ANGLE' in atr:
-            inc_angle = float(atr['CENTER_INCIDENCE_ANGLE'])
-        else:
-            inc_angle = ut.incidence_angle(atr, dimension=0, print_msg=print_msg)
-        az_angle = ut.heading2azimuth_angle(float(atr['HEADING']))
-        return inc_angle, az_angle
-
     def get_los_geometry(self, geom_obj, print_msg=False):
         """Get the Line-of-Sight geometry info in incidence and azimuth angle in degrees."""
         lat, lon = self.get_site_lat_lon()
-        vprint = print if print_msg else lambda *args, **kwargs: None
 
         # get LOS geometry
         if isinstance(geom_obj, str):
@@ -794,21 +762,17 @@ class GNSS:
             atr = readfile.read_attribute(geom_obj)
             coord = coordinate(atr, lookup_file=geom_obj)
             y, x = coord.geo2radar(lat, lon, print_msg=print_msg)[0:2]
-            length, width = int(atr['LENGTH']), int(atr['WIDTH'])
-            outside = (y < 0 or y >= length or x < 0 or x >= width)
-            y_c = min(max(int(y), 0), length - 1)
-            x_c = min(max(int(x), 0), width - 1)
-            kwargs = dict(box=(x_c, y_c, x_c + 1, y_c + 1), print_msg=print_msg)
-            inc_angle = readfile.read(geom_obj, datasetName='incidenceAngle', **kwargs)[0][0, 0]
-            az_angle = readfile.read(geom_obj, datasetName='azimuthAngle', **kwargs)[0][0, 0]
-            if outside or (not np.isfinite(inc_angle)) or (not np.isfinite(az_angle)):
-                inc_angle, az_angle = self._los_geometry_from_metadata(atr, print_msg=print_msg)
-                vprint(f'  {self.site} is outside valid geometry; '
-                       f'use scene-mean inc/az = {inc_angle:.2f}/{az_angle:.2f} deg')
+            # check against image boundary
+            y = max(0, y);  y = min(int(atr['LENGTH'])-1, y)
+            x = max(0, x);  x = min(int(atr['WIDTH'])-1, x)
+            kwargs = dict(box=(x,y,x+1,y+1), print_msg=print_msg)
+            inc_angle = readfile.read(geom_obj, datasetName='incidenceAngle', **kwargs)[0][0,0]
+            az_angle  = readfile.read(geom_obj, datasetName='azimuthAngle',   **kwargs)[0][0,0]
 
         elif isinstance(geom_obj, dict):
             # use mean inc/az_angle from metadata
-            inc_angle, az_angle = self._los_geometry_from_metadata(geom_obj, print_msg=print_msg)
+            inc_angle = ut.incidence_angle(geom_obj, dimension=0, print_msg=print_msg)
+            az_angle  = ut.heading2azimuth_angle(float(geom_obj['HEADING']))
 
         else:
             raise ValueError(f'input geom_obj is neither str nor dict: {geom_obj}')
