@@ -1553,8 +1553,37 @@ def plot_gnss(ax, SNWE, inps, metadata=dict(), print_msg=True):
         if site_names.size == 0:
             raise ValueError('No GNSS left after --mask-gnss!')
 
-    if inps.ref_gnss_site and inps.ref_gnss_site not in site_names:
-        raise ValueError(f'input reference GNSS site "{inps.ref_gnss_site}" not available!')
+    if inps.ref_gnss_site:
+        ref_u = str(inps.ref_gnss_site).upper()
+        names_u = np.array([str(s).upper() for s in site_names])
+        if ref_u not in names_u:
+            ref_name, ref_lat, ref_lon = gnss.lookup_gnss_site(
+                ref_u, source=inps.gnss_source, print_msg=False,
+            )
+            if ref_name is None:
+                raise ValueError(
+                    f'input reference GNSS site "{inps.ref_gnss_site}" not found in {inps.gnss_source} catalog!'
+                )
+            if inps.gnss_source == 'TGM':
+                gnss_dir = getattr(inps, 'gnss_dir', None)
+                if gnss_dir is None and metadata.get('FILE_PATH'):
+                    gnss_dir = os.path.join(os.path.dirname(metadata['FILE_PATH']), 'GNSS-TGM')
+                if gnss_dir and not os.path.isfile(os.path.join(gnss_dir, f'{ref_name}.txt')):
+                    raise ValueError(
+                        f'reference GNSS site "{ref_name}" has no time series file in {gnss_dir}'
+                    )
+            vprint(f'--ref-gnss {ref_name} is outside the map extent; keep it for referencing only')
+            if 'UTM_ZONE' in metadata.keys():
+                ref_lat, ref_lon = ut0.latlon2utm(
+                    metadata, np.array([ref_lat]), np.array([ref_lon]),
+                )
+                ref_lat, ref_lon = float(np.atleast_1d(ref_lat)[0]), float(np.atleast_1d(ref_lon)[0])
+            site_names = np.append(site_names, ref_name)
+            site_lats = np.append(site_lats, np.float32(ref_lat))
+            site_lons = np.append(site_lons, np.float32(ref_lon))
+            inps.ref_gnss_site = ref_name
+        else:
+            inps.ref_gnss_site = str(site_names[names_u == ref_u][0])
 
     k = metadata['FILE_TYPE']
     if inps.gnss_component and k not in ['velocity', 'timeseries', 'displacement']:
@@ -1606,8 +1635,11 @@ def plot_gnss(ax, SNWE, inps, metadata=dict(), print_msg=True):
             #ax.annotate(site_names[ref_ind], xy=(site_lons[ref_ind], site_lats[ref_ind]), fontsize=inps.font_size)
             # update value
             ref_val = site_obs[ref_ind]
-            if not np.isnan(ref_val):
-                site_obs -= ref_val
+            if np.isfinite(ref_val):
+                site_obs = site_obs - ref_val
+                vprint(f'reference GNSS LOS to {inps.ref_gnss_site}: subtract {ref_val*unit_fac:.2f} {inps.disp_unit}')
+            else:
+                vprint(f'WARNING: GNSS LOS at {inps.ref_gnss_site} is NaN; GNSS is NOT referenced')
 
         # scale to the same unit as InSAR
         site_obs *= unit_fac
@@ -1723,12 +1755,24 @@ def plot_insar_vs_gnss_scatter(vel_file, csv_file='gnss_enu2los_UNR.csv', msk_fi
     off_med = np.nanmedian(insar_obs - gnss_obs)
     print(f'median offset between InSAR and GNSS [before common referencing]: {off_med:.2f} cm/year')
 
-    # reference site
+    # reference site (InSAR may be NaN if the site is outside coverage)
     if ref_gnss_site:
         print(f'referencing both InSAR and GNSS data to site: {ref_gnss_site}')
-        ref_ind = sites.tolist().index(ref_gnss_site)
-        gnss_obs -= gnss_obs[ref_ind]
-        insar_obs -= insar_obs[ref_ind]
+        names = [str(s).strip().upper() for s in np.atleast_1d(sites)]
+        ref_u = str(ref_gnss_site).strip().upper()
+        if ref_u not in names:
+            print(f'WARNING: reference GNSS site {ref_gnss_site} not in station list; skip common referencing')
+        else:
+            ref_ind = names.index(ref_u)
+            if np.isfinite(gnss_obs[ref_ind]):
+                gnss_obs = gnss_obs - gnss_obs[ref_ind]
+            else:
+                print(f'WARNING: GNSS at {ref_gnss_site} is NaN; skip GNSS referencing')
+            if np.isfinite(insar_obs[ref_ind]):
+                insar_obs = insar_obs - insar_obs[ref_ind]
+            else:
+                print(f'WARNING: InSAR at {ref_gnss_site} is unavailable (outside coverage); '
+                      'GNSS referenced to that site, InSAR left unchanged')
 
     # remove NaN value
     print(f'removing sites with NaN values in GNSS or {xname}')
@@ -1743,6 +1787,10 @@ def plot_insar_vs_gnss_scatter(vel_file, csv_file='gnss_enu2los_UNR.csv', msk_fi
     gnss_obs = gnss_obs[flag]
     insar_obs = insar_obs[flag]
     sites = sites[flag]
+
+    if gnss_obs.size == 0:
+        print('No sites left after NaN/vlim filtering; skip scatter plot')
+        return sites, insar_obs, gnss_obs
 
     # stats
     print(f'GNSS   min/max: {np.nanmin(gnss_obs):.2f} / {np.nanmax(gnss_obs):.2f}')

@@ -88,6 +88,13 @@ def get_closure_phase_bias_parser(subparsers=None):
     return parser
 
 
+def get_correct_gnss_ramp_parser(subparsers=None):
+    from mintpy.cli import correct_gnss_ramp
+    parser = correct_gnss_ramp.create_parser(subparsers)
+    parser.set_defaults(func=correct_gnss_ramp.main)
+    return parser
+
+
 def get_dem_error_parser(subparsers=None):
     from mintpy.cli import dem_error
     parser = dem_error.create_parser(subparsers)
@@ -613,6 +620,7 @@ def get_parser():
 
     # noise reduction / error correction
     get_closure_phase_bias_parser(sp)
+    get_correct_gnss_ramp_parser(sp)
     get_dem_error_parser(sp)
     get_iono_split_spectrum_parser(sp)
     get_iono_tec_parser(sp)

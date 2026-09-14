@@ -555,13 +555,20 @@ def plot_slice(ax, data, metadata, inps):
             gnss_obj = gnss.get_gnss_class(inps.gnss_source)(**gnss_kwargs)
             ref_site_lalo = gnss_obj.get_site_lat_lon()
             y, x = coord.geo2radar(ref_site_lalo[0], ref_site_lalo[1])[0:2]
-            ref_data = data[y - inps.pix_box[1], x - inps.pix_box[0]]
-            data -= ref_data
-            vprint('referencing InSAR data to the pixel nearest to GNSS station: '
-                   f'{inps.ref_gnss_site} at [{ref_site_lalo[0]:.6f}, {ref_site_lalo[1]:.6f}] '
-                   f'by substrating {ref_data:.3f} {inps.disp_unit}')
-            # do not show the original InSAR reference point
-            inps.disp_ref_pixel = False
+            row = int(y) - inps.pix_box[1]
+            col = int(x) - inps.pix_box[0]
+            n_row, n_col = data.shape[-2], data.shape[-1]
+            if 0 <= row < n_row and 0 <= col < n_col and np.isfinite(data[row, col]):
+                ref_data = data[row, col]
+                data -= ref_data
+                vprint('referencing InSAR data to the pixel nearest to GNSS station: '
+                       f'{inps.ref_gnss_site} at [{ref_site_lalo[0]:.6f}, {ref_site_lalo[1]:.6f}] '
+                       f'by substrating {ref_data:.3f} {inps.disp_unit}')
+                # do not show the original InSAR reference point
+                inps.disp_ref_pixel = False
+            else:
+                vprint(f'WARNING: GNSS station {inps.ref_gnss_site} is outside the InSAR coverage; '
+                       'skip referencing InSAR to that pixel. GNSS LOS values are still relative to it.')
 
         # Plot data
         if inps.disp_dem_blend:
