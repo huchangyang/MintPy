@@ -566,23 +566,28 @@ def fit_time_func(model, date_list, ts_dis, disp_unit='cm', G_fit=None, conf_lev
     ts_fit = None
     ts_fit_lim = None
 
-    if np.all(np.isnan(ts_dis)):
+    ts_dis = np.asarray(ts_dis, dtype=np.float64).reshape(-1)
+    valid = np.isfinite(ts_dis)
+    if not np.any(valid):
+        return m_strs, ts_fit, ts_fit_lim
+
+    # Keep the full-date design matrix so G_fit (dense prediction) shares
+    # the same time origin; drop only the NaN observation rows.
+    G = time_func.get_design_matrix4time_func(date_list, model=model, seconds=seconds)
+    num_param = G.shape[1]
+    num_obs = int(np.count_nonzero(valid))
+    if num_obs <= num_param or np.linalg.matrix_rank(G[valid]) < num_param:
         return m_strs, ts_fit, ts_fit_lim
 
     # 1.1 estimate time func parameter via least squares (OLS)
-    G, m, e2 = time_func.estimate_time_func(
-        model=model,
-        date_list=date_list,
-        dis_ts=ts_dis,
-        seconds=seconds)
+    m, e2 = linalg.lstsq(G[valid], ts_dis[valid], cond=None)[:2]
 
     # 1.2 calc the precision of time func parameters
     # using the OLS estimation residues e2 = sum((d - Gm) ** 2)
     # assuming obs errors following normal distribution in time
-    num_obs = len(date_list)
-    num_param = G.shape[1]
-    G_inv = linalg.inv(np.dot(G.T, G))
-    m_var_sum = e2.flatten() / (num_obs - num_param)
+    Gv = G[valid]
+    G_inv = linalg.inv(np.dot(Gv.T, Gv))
+    m_var_sum = np.asarray(e2).reshape(-1) / (num_obs - num_param)
     m_std = np.sqrt(np.dot(np.diag(G_inv).reshape(-1, 1), m_var_sum))
 
     # 1.3 translate estimation result into HDF5 ready datasets
@@ -951,7 +956,8 @@ class timeseriesViewer():
             if self.zero_first:
                 off = ts_dis[self.zero_idx]
                 ts_dis -= off
-                ts_fit -= off
+                if ts_fit is not None:
+                    ts_fit -= off
 
             if self.offset:
                 ts_dis += self.offset * (num_file - 1 - i)
@@ -971,7 +977,7 @@ class timeseriesViewer():
                 labels.append(ppar.label)
 
                 # plot model prediction
-                if self.plot_model:
+                if self.plot_model and ts_fit is not None:
                     fpar = argparse.Namespace()
                     fpar.linewidth = 3
                     fpar.color = 'C1' if num_file == 1 else ppar.mfc

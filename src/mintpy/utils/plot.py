@@ -1155,17 +1155,43 @@ def plot_gnss(ax, SNWE, inps, metadata=dict(), print_msg=True):
         SNWE = (south, north, west, east)
 
     # query for GNSS stations
+    site_list_file = None
+    gnss_dir = None
+    if inps.gnss_source == 'TGM':
+        gnss_dir = gnss.default_tgm_data_dir(
+            metadata.get('FILE_PATH'), getattr(inps, 'gnss_dir', None))
+        if gnss_dir:
+            cand = os.path.join(gnss_dir, gnss.TGM_SITE_LIST_FILENAME)
+            if os.path.isfile(cand):
+                site_list_file = cand
     site_names, site_lats, site_lons = gnss.search_gnss(
         SNWE,
         start_date=start_date,
         end_date=end_date,
         source=inps.gnss_source,
+        site_list_file=site_list_file,
         print_msg=print_msg,
     )
     if site_names.size == 0:
         warnings.warn(f'No GNSS found within {SNWE} during {start_date} - {end_date}!')
         vprint('  continue without GNSS plots.')
         return ax
+
+    # TGM: keep only stations that have local time series .txt
+    if inps.gnss_source == 'TGM':
+        if gnss_dir and os.path.isdir(gnss_dir):
+            have_file = np.array([os.path.isfile(os.path.join(gnss_dir, f'{s}.txt'))
+                                  for s in site_names])
+            n_before = len(site_names)
+            site_names = site_names[have_file]
+            site_lats = site_lats[have_file]
+            site_lons = site_lons[have_file]
+            if site_names.size < n_before:
+                vprint(f'TGM: keep only stations with local data: {site_names.size} of {n_before}')
+            if site_names.size == 0:
+                warnings.warn('No TGM stations with local .txt files in --gnss-dir. Check path and files.')
+                vprint('  continue without GNSS plots.')
+                return ax
 
     # print the nearest GNSS to the current reference point
     # to facilitate the --ref-gnss option setup
@@ -1182,7 +1208,10 @@ def plot_gnss(ax, SNWE, inps, metadata=dict(), print_msg=True):
         vprint(msg)
 
     # print the GNSS solution reference frame
-    gnss_obj = gnss.get_gnss_class(inps.gnss_source)(site_names[0])
+    gnss_kwargs = {}
+    if inps.gnss_source == 'TGM' and gnss_dir:
+        gnss_kwargs['data_dir'] = gnss_dir
+    gnss_obj = gnss.get_gnss_class(inps.gnss_source)(site_names[0], **gnss_kwargs)
     vprint(f'GNSS source: {gnss_obj.source}')
     vprint(f'GNSS reference frame: {gnss_obj.version}')
 
@@ -1222,25 +1251,32 @@ def plot_gnss(ax, SNWE, inps, metadata=dict(), print_msg=True):
         msg += f' with respect to {inps.ref_gnss_site} ...' if inps.ref_gnss_site else ' ...'
         vprint(msg)
         vprint(f'number of available GNSS stations: {len(site_names)}')
-        vprint(f'start date: {start_date}')
-        vprint(f'end   date: {end_date}')
+        use_full_span = getattr(inps, 'gnss_vel_full_span', False) and k == 'velocity'
+        if use_full_span:
+            vprint('GNSS velocity: full GNSS time span (--gnss-full-span)')
+        else:
+            vprint(f'start date: {start_date}')
+            vprint(f'end   date: {end_date}')
         vprint(f'components projection: {inps.gnss_component}')
 
         # get GNSS LOS observations
         # save absolute value to support both spatially relative and absolute comparison
         # without compromising the re-usability of the CSV file
         obs_type = 'velocity' if k == 'velocity' else 'displacement'
+        gnss_data_dir = gnss_dir if inps.gnss_source == 'TGM' else None
         site_obs = gnss.get_los_obs(
             meta=metadata,
             obs_type=obs_type,
             site_names=site_names,
-            start_date=start_date,
-            end_date=end_date,
+            start_date=None if use_full_span else start_date,
+            end_date=None if use_full_span else end_date,
             source=inps.gnss_source,
             gnss_comp=inps.gnss_component,
             horz_az_angle=inps.horz_az_angle,
             print_msg=print_msg,
             redo=inps.gnss_redo,
+            gnss_data_dir=gnss_data_dir,
+            full_span=use_full_span,
         )
 
         # reference GNSS

@@ -24,6 +24,10 @@ EXAMPLE = """example:
   # multiple time-series files
   tsview.py timeseries_ERA5_ramp_demErr.h5 timeseries_ERA5_ramp.h5 timeseries_ERA5.h5 timeseries.h5 --off 5
   tsview.py timeseries_ERA5_ramp_demErr.h5 ../GIANT/Stack/LS-PARAMS.h5 --off 5 --label mintpy giant
+
+  # GNSS overlay on the map (geo-coordinates)
+  tsview.py geo_timeseries_SET_ion_ERA5_demErr.h5 --show-gnss --gnss-source TGM --gnss-dir /path/to/gnss_tgm --gnss-label
+  tsview.py geo_timeseries_SET_ion_ERA5_demErr.h5 --show-gnss --gnss-source TGM --gnss-dir /path/to/gnss_tgm --gnss-comp enu2los --ref-gnss S103
 """
 
 
@@ -124,11 +128,6 @@ def cmd_line_parse(iargs=None):
     # use iargs        for python call
     # use sys.argv[1:] for command line call
     inps.argv = iargs or sys.argv[1:]
-
-    # check: --gnss-comp option (not implemented for tsview yet)
-    if inps.gnss_component:
-        msg = f'--gnss-comp is not supported for {os.path.basename(__file__)}'
-        raise NotImplementedError(msg)
 
     # check: --label option (same number as input files)
     if inps.file_label:
